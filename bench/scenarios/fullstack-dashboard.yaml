@@ -1,0 +1,63 @@
+name: fullstack-dashboard
+description: "Complex: Flask backend + React frontend dashboard with charts. Tests all 4 agents working together."
+category: ablation
+complexity: complex
+request: |
+  Build a fullstack dashboard application:
+  - Backend: Python Flask REST API with endpoints for /api/metrics (returns JSON array of {name, value, timestamp}),
+    /api/summary (returns aggregated stats), and /api/health.
+  - Frontend: React single-page app with a dashboard showing:
+    - A summary card row (total metrics, average value, last updated)
+    - A line chart showing metric values over time (use Chart.js via CDN)
+    - A data table listing all metrics with sorting
+  - Use a clean, modern CSS design with a dark sidebar nav and light content area.
+  - Include a requirements.txt for Python and package.json for React.
+  - The Flask app should serve the React build as static files.
+runs: 3
+test_command: "cd $ARTIFACTS_DIR && python -c 'import app; print(\"import ok\")' 2>/dev/null || true"
+assertions:
+  - type: file_exists
+    path: "*.py"
+  - type: file_exists
+    path: "*.jsx"
+  - type: file_exists
+    path: "*.css"
+  - type: pattern_match
+    path: "*.py"
+    pattern: "flask|Flask"
+  - type: pattern_match
+    path: "*.py"
+    pattern: "/api/metrics|/api/summary"
+  - type: pattern_match
+    path: "*.jsx"
+    pattern: "Chart|chart"
+  - type: file_exists
+    path: "requirements.txt"
+  - type: file_exists
+    path: "package.json"
+  - type: file_count_min
+    path: "*.py"
+    min: 1
+  - type: file_count_min
+    path: "*.jsx"
+    min: 2
+configs:
+  - name: all-opus
+    model_overrides:
+      conductor: anthropic/claude-opus-4-5-20251101
+      architect: anthropic/claude-opus-4-5-20251101
+      designer: anthropic/claude-opus-4-5-20251101
+      developer: anthropic/claude-opus-4-5-20251101
+  - name: all-sonnet
+    model_overrides:
+      conductor: anthropic/claude-sonnet-4-5-20250929
+      architect: anthropic/claude-sonnet-4-5-20250929
+      designer: anthropic/claude-sonnet-4-5-20250929
+      developer: anthropic/claude-sonnet-4-5-20250929
+  - name: heterogeneous
+  - name: single-agent
+    single_agent: true
+  - name: no-verify
+    disable_verify: true
+  - name: adaptive-3tier
+    adaptive: true

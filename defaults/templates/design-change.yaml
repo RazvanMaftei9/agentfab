@@ -1,0 +1,42 @@
+name: design-change
+description: "Apply a design change: designer updates mockups, developer re-implements with designer review."
+match_keywords: [design, redesign, restyle, theme, ui, ux, layout, mockup, visual, color, font, style]
+tasks:
+  - id: t1
+    agent: designer
+    description: "Update the design/mockups for {{request}}"
+    scope: standard
+  - id: t2
+    agent: developer
+    description: "Implement the design changes for {{request}}"
+    depends_on: [t1]
+    scope: standard
+    loop_id: loop-1
+loops:
+  - id: loop-1
+    participants: [developer, designer]
+    states:
+      - name: WORKING
+        agent: developer
+      - name: REVIEWING
+        agent: designer
+      - name: REVISING
+        agent: developer
+      - name: APPROVED
+        agent: ""
+      - name: ESCALATED
+        agent: ""
+    transitions:
+      - from: WORKING
+        to: REVIEWING
+      - from: REVIEWING
+        to: APPROVED
+        condition: approved
+      - from: REVIEWING
+        to: REVISING
+        condition: revise
+      - from: REVISING
+        to: REVIEWING
+    initial_state: WORKING
+    terminal_states: [APPROVED, ESCALATED]
+    max_transitions: 6

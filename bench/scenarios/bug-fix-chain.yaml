@@ -1,0 +1,79 @@
+name: bug-fix-chain
+description: "Medium: REST API with 3 related bugs to fix. Tests targeted debugging."
+category: ablation
+complexity: medium
+request: |
+  Build a Python Flask REST API for a bookstore with the following requirements and intentional bugs to fix:
+
+  Create these files:
+  1. app.py - Main Flask application with routes:
+     - GET /books - list all books
+     - POST /books - add a book (title, author, price, isbn)
+     - GET /books/<isbn> - get book by ISBN
+     - PUT /books/<isbn> - update a book
+     - DELETE /books/<isbn> - delete a book
+     - GET /books/search?q=<query> - search by title or author
+
+  2. models.py - Book model with validation:
+     - Title: required, 1-200 chars
+     - Author: required, 1-100 chars
+     - Price: required, positive float
+     - ISBN: required, valid ISBN-13 format (13 digits)
+
+  3. test_app.py - pytest tests covering all endpoints and validation
+
+  Requirements:
+  - Use in-memory storage (dict keyed by ISBN)
+  - Return proper HTTP status codes (200, 201, 400, 404)
+  - Input validation with descriptive error messages
+  - Search should be case-insensitive partial match
+  - Include requirements.txt with flask and pytest
+
+  Make sure the tests in test_app.py actually pass when run with pytest.
+runs: 3
+verify_command: none
+test_command: "cd $ARTIFACTS_DIR && pip install -q flask pytest 2>/dev/null && python -m pytest test_app.py -v 2>&1 || true"
+assertions:
+  - type: file_exists
+    path: "app.py"
+  - type: file_exists
+    path: "models.py"
+  - type: file_exists
+    path: "test_app.py"
+  - type: file_exists
+    path: "requirements.txt"
+  - type: pattern_match
+    path: "app.py"
+    pattern: "flask|Flask"
+  - type: pattern_match
+    path: "app.py"
+    pattern: "GET|POST|PUT|DELETE"
+  - type: pattern_match
+    path: "models.py"
+    pattern: "class Book|validate"
+  - type: pattern_match
+    path: "test_app.py"
+    pattern: "def test_|pytest"
+  - type: file_count_min
+    path: "*.py"
+    min: 3
+configs:
+  - name: all-opus
+    model_overrides:
+      conductor: anthropic/claude-opus-4-5-20251101
+      architect: anthropic/claude-opus-4-5-20251101
+      designer: anthropic/claude-opus-4-5-20251101
+      developer: anthropic/claude-opus-4-5-20251101
+  - name: all-sonnet
+    model_overrides:
+      conductor: anthropic/claude-sonnet-4-5-20250929
+      architect: anthropic/claude-sonnet-4-5-20250929
+      designer: anthropic/claude-sonnet-4-5-20250929
+      developer: anthropic/claude-sonnet-4-5-20250929
+  - name: heterogeneous
+  - name: single-agent
+    single_agent: true
+  - name: no-verify
+    disable_verify: true
+  - name: adaptive-3tier
+    adaptive: true

@@ -1,0 +1,68 @@
+name: design-system-app
+description: "Complex: Task management app with strict Material Design theme. Tests designer/developer loop."
+category: ablation
+complexity: complex
+request: |
+  Build a task management web application with a strict Material Design theme:
+  - Design Requirements (Material Design 3):
+    - Use Material Design color system with primary (#6750A4), secondary (#958DA5), surface colors
+    - Cards with 12px border-radius and subtle elevation shadows
+    - Typography: Roboto font family with proper weight hierarchy (400/500/700)
+    - FAB (Floating Action Button) for adding new tasks
+    - Chips for task categories/tags
+    - Snackbar notifications for actions (task added, deleted, completed)
+    - Responsive layout: single column on mobile, 2-column on tablet, 3-column on desktop
+  - Functionality:
+    - Add tasks with title, description, due date, priority (low/medium/high), and category tags
+    - View tasks in a Kanban-style board (To Do, In Progress, Done columns)
+    - Drag-and-drop to move tasks between columns (or button-based fallback)
+    - Filter tasks by category, priority, or search text
+    - Mark tasks as complete with animation
+    - Delete tasks with confirmation dialog
+    - Local storage persistence
+  - Files: index.html, styles.css, app.js
+  - No build tools — pure HTML/CSS/JS with Google Fonts CDN for Roboto
+runs: 3
+verify_command: none
+assertions:
+  - type: file_exists
+    path: "index.html"
+  - type: file_exists
+    path: "*.css"
+  - type: file_exists
+    path: "*.js"
+  - type: pattern_match
+    path: "*.css"
+    pattern: "6750A4|border-radius|Roboto"
+  - type: pattern_match
+    path: "*.css"
+    pattern: "media.*max-width|@media"
+  - type: pattern_match
+    path: "*.js"
+    pattern: "localStorage"
+  - type: pattern_match
+    path: "index.html"
+    pattern: "Roboto|fonts.googleapis"
+  - type: pattern_match
+    path: "*.js"
+    pattern: "addEventListener"
+configs:
+  - name: all-opus
+    model_overrides:
+      conductor: anthropic/claude-opus-4-5-20251101
+      architect: anthropic/claude-opus-4-5-20251101
+      designer: anthropic/claude-opus-4-5-20251101
+      developer: anthropic/claude-opus-4-5-20251101
+  - name: all-sonnet
+    model_overrides:
+      conductor: anthropic/claude-sonnet-4-5-20250929
+      architect: anthropic/claude-sonnet-4-5-20250929
+      designer: anthropic/claude-sonnet-4-5-20250929
+      developer: anthropic/claude-sonnet-4-5-20250929
+  - name: heterogeneous
+  - name: single-agent
+    single_agent: true
+  - name: no-verify
+    disable_verify: true
+  - name: adaptive-3tier
+    adaptive: true

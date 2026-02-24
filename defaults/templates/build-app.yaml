@@ -1,0 +1,47 @@
+name: build-app
+description: "Build a new application: architect decides tech stack, designer creates mockups, developer implements with designer review."
+match_keywords: [build, create, make, develop, implement, new, app, application, website, tool, service]
+tasks:
+  - id: t1
+    agent: architect
+    description: "Decide the technology stack, storage approach, and data model for {{request}}"
+    scope: small
+  - id: t2
+    agent: designer
+    description: "Create UI/UX mockups for {{request}}"
+    depends_on: [t1]
+    scope: standard
+  - id: t3
+    agent: developer
+    description: "Implement {{request}} following the architect's technology decisions and the designer's mockups"
+    depends_on: [t1, t2]
+    scope: large
+    loop_id: loop-1
+loops:
+  - id: loop-1
+    participants: [developer, designer]
+    states:
+      - name: WORKING
+        agent: developer
+      - name: REVIEWING
+        agent: designer
+      - name: REVISING
+        agent: developer
+      - name: APPROVED
+        agent: ""
+      - name: ESCALATED
+        agent: ""
+    transitions:
+      - from: WORKING
+        to: REVIEWING
+      - from: REVIEWING
+        to: APPROVED
+        condition: approved
+      - from: REVIEWING
+        to: REVISING
+        condition: revise
+      - from: REVISING
+        to: REVIEWING
+    initial_state: WORKING
+    terminal_states: [APPROVED, ESCALATED]
+    max_transitions: 10

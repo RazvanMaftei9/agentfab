@@ -1,0 +1,37 @@
+name: fix-bug
+description: "Fix a bug: developer fixes with architect review."
+match_keywords: [fix, bug, error, broken, crash, issue, debug, patch, repair]
+tasks:
+  - id: t1
+    agent: developer
+    description: "Fix the bug: {{request}}"
+    scope: standard
+    loop_id: loop-1
+loops:
+  - id: loop-1
+    participants: [developer, architect]
+    states:
+      - name: WORKING
+        agent: developer
+      - name: REVIEWING
+        agent: architect
+      - name: REVISING
+        agent: developer
+      - name: APPROVED
+        agent: ""
+      - name: ESCALATED
+        agent: ""
+    transitions:
+      - from: WORKING
+        to: REVIEWING
+      - from: REVIEWING
+        to: APPROVED
+        condition: approved
+      - from: REVIEWING
+        to: REVISING
+        condition: revise
+      - from: REVISING
+        to: REVIEWING
+    initial_state: WORKING
+    terminal_states: [APPROVED, ESCALATED]
+    max_transitions: 6

@@ -1,0 +1,35 @@
+name: architect
+purpose: "High-level system architecture: technology stack, component boundaries, and data model."
+capabilities: [design_docs, code_review, arch_analysis, integration_testing]
+model: openai/gpt-5.2
+cold_storage_retention_days: 1095
+curation_threshold: 50
+tools:
+  - name: shell
+    instructions: "Execute shell commands to inspect artifacts, verify builds, and gather evidence for review findings."
+    command: "$TOOL_ARG_COMMAND"
+    parameters:
+      command:
+        type: string
+        description: "The shell command to execute"
+        required: true
+    config:
+      timeout: "120"
+review_prompt: |
+  ## Review Protocol
+  When reviewing another agent's work:
+  - Start your response with VERDICT: approved or VERDICT: revise on its own line
+  - If revising, list numbered issues with specific file references
+  - Be precise: "src/auth.go:42 missing nil check" not "needs better error handling"
+  - Only flag issues that violate the design or user request — do not nitpick style
+  - If the developer cites a binding artifact (HTML mockup, design spec) to defend a choice, accept it
+  - Approve when the code is functionally correct even if you would have done it differently
+review_guidelines: |
+  - File structure matches architecture (correct modules, no missing files)
+  - Import graph is valid (no broken imports, no circular deps)
+  - Data flow patterns match design (event-driven, service-mediated, etc.)
+  - Component boundaries respected (no business logic in views, etc.)
+  - No runtime errors (missing exports, type mismatches)
+  - Dependencies match architect requirements
+  - For multi-package projects: verify the package "name" field in package.json matches the directory name, and that any `file:` dependency paths and import specifiers in consuming packages reference the correct name and path
+  - Do NOT dispute values (colors, sizes, spacing) that come from binding design artifacts (HTML mockups, design specs)

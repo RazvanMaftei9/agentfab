@@ -1,0 +1,24 @@
+syntax = "proto3";
+
+package agentfab.v1;
+
+option go_package = "github.com/razvanmaftei/agentfab/gen/agentfab/v1;agentfabv1";
+
+import "agentfab/v1/message.proto";
+
+service AgentService {
+  rpc SendMessage(Message) returns (SendMessageResponse);
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+}
+
+message SendMessageResponse {
+  bool accepted = 1;
+  string error = 2;
+}
+
+message HeartbeatRequest {}
+
+message HeartbeatResponse {
+  string name = 1;
+  string status = 2; // "ready", "busy", "shutting_down"
+}

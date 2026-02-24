@@ -1,0 +1,69 @@
+name: cross-cutting-refactor
+description: "Complex: Go CLI todo app with clean architecture. Tests architect-driven decisions."
+category: ablation
+complexity: complex
+request: |
+  Build a Go CLI todo application using clean architecture principles:
+  - Architecture (3 layers):
+    - domain/: Pure domain types and interfaces
+      - todo.go: Todo struct (ID, Title, Description, Done, CreatedAt, DueDate, Priority)
+      - repository.go: TodoRepository interface (Add, Get, List, Update, Delete, ListByPriority)
+    - usecase/: Business logic
+      - todo_usecase.go: TodoUseCase struct implementing AddTodo, CompleteTodo, ListTodos,
+        DeleteTodo, ListOverdue, ListByPriority
+      - Validation: title required, priority must be low/medium/high
+    - infrastructure/:
+      - json_repository.go: JSON file-based implementation of TodoRepository
+      - Stores todos in ~/.todos.json
+  - CLI interface (cmd/todo/main.go):
+    - Subcommands: add, list, complete, delete, overdue, priority
+    - add --title "..." --desc "..." --due "2024-01-15" --priority high
+    - list (shows all todos in a table format)
+    - complete <id>
+    - delete <id>
+    - overdue (shows past-due incomplete todos)
+    - priority <level> (filters by priority)
+    - Use flag package for argument parsing
+  - Include go.mod with module path "github.com/example/todo"
+  - Add a Makefile with: build, test, clean targets
+runs: 3
+verify_command: "cd $SCRATCH_DIR && go build ./... 2>&1"
+assertions:
+  - type: file_exists
+    path: "go.mod"
+  - type: file_exists
+    path: "*.go"
+  - type: pattern_match
+    path: "go.mod"
+    pattern: "module"
+  - type: file_exists
+    path: "Makefile"
+  - type: pattern_match
+    path: "*.go"
+    pattern: "type Todo struct|TodoRepository"
+  - type: file_count_min
+    path: "*.go"
+    min: 3
+  - type: pattern_match
+    path: "*.go"
+    pattern: "func.*Add|func.*List|func.*Delete"
+configs:
+  - name: all-opus
+    model_overrides:
+      conductor: anthropic/claude-opus-4-5-20251101
+      architect: anthropic/claude-opus-4-5-20251101
+      designer: anthropic/claude-opus-4-5-20251101
+      developer: anthropic/claude-opus-4-5-20251101
+  - name: all-sonnet
+    model_overrides:
+      conductor: anthropic/claude-sonnet-4-5-20250929
+      architect: anthropic/claude-sonnet-4-5-20250929
+      designer: anthropic/claude-sonnet-4-5-20250929
+      developer: anthropic/claude-sonnet-4-5-20250929
+  - name: heterogeneous
+  - name: single-agent
+    single_agent: true
+  - name: no-verify
+    disable_verify: true
+  - name: adaptive-3tier
+    adaptive: true

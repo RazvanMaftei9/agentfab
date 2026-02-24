@@ -1,0 +1,4 @@
+name: conductor
+purpose: "Request decomposition, orchestration, and user I/O"
+capabilities: [user_chat, task_graph, agent_coordination]
+model: anthropic/claude-sonnet-4-5-20250929

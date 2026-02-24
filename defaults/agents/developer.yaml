@@ -1,0 +1,151 @@
+name: developer
+purpose: "Implementation specialist. Convert upstream artifacts into production-ready code with strict fidelity and minimal iterations."
+capabilities: [code_gen, debugging, implementation_fidelity, local_execution, self_correction, git_versioning]
+model: anthropic/claude-opus-4-5-20251101
+cold_storage_retention_days: 1095
+curation_threshold: 50
+task_timeout: 20m
+tools:
+  - name: shell
+    instructions: "Execute shell commands for git operations, builds, tests, and file manipulation."
+    command: "$TOOL_ARG_COMMAND"
+    parameters:
+      command:
+        type: string
+        description: "The shell command to execute"
+        required: true
+    config:
+      timeout: "120"
+  - name: git
+    instructions: "Finalize produced project directories in shared storage as git repositories with at least one commit."
+    mode: post_process
+    command: |
+      ROOT="$TOOL_RESOLVED_DIR"
+      if [ -n "${TOOL_TASK_ID:-}" ]; then
+        DESC="${TOOL_TASK_DESCRIPTION:-update artifacts}"
+        DESC="$(printf '%.80s' "$DESC")"
+        MSG="[${TOOL_TASK_ID}] ${DESC}"
+      else
+        MSG="agentfab: update artifacts for $TOOL_REQUEST_ID"
+      fi
+
+      if ! command -v git >/dev/null 2>&1; then
+        echo "ERROR: git not available; cannot finalize repositories" >&2
+        exit 1
+      fi
+      if [ -z "$ROOT" ] || [ ! -d "$ROOT" ]; then
+        echo "ERROR: artifact root missing: $ROOT" >&2
+        exit 1
+      fi
+
+      commit_repo() {
+        repo="$1"
+        (
+          cd "$repo" || exit 1
+          if [ ! -d .git ]; then
+            git init >/dev/null 2>&1 || git init
+          fi
+
+          git config user.name "${TOOL_GIT_USER_NAME:-AgentFab Developer}"
+          git config user.email "${TOOL_GIT_USER_EMAIL:-developer@agentfab.local}"
+
+          git add -A
+          if git diff --cached --quiet; then
+            if git rev-parse --verify HEAD >/dev/null 2>&1; then
+              echo "[$repo] no changes to commit; HEAD $(git rev-parse --short HEAD)"
+            else
+              git commit --allow-empty -m "$MSG" >/dev/null 2>&1 || git commit --allow-empty -m "$MSG"
+              echo "[$repo] committed $(git rev-parse --short HEAD)"
+            fi
+            exit 0
+          fi
+
+          git commit -m "$MSG" >/dev/null 2>&1 || git commit -m "$MSG"
+          echo "[$repo] committed $(git rev-parse --short HEAD)"
+        )
+      }
+
+      ROOT_HAS_FILES=0
+      if [ -n "${TOOL_MATCHED_FILES:-}" ]; then
+        ROOT_HAS_FILES="$(printf '%s\n' "$TOOL_MATCHED_FILES" | awk -F/ 'NF==1 && length($1)>0 {found=1} END {if(found) print 1; else print 0}')"
+        TOP_LEVELS="$(printf '%s\n' "$TOOL_MATCHED_FILES" | awk -F/ 'NF>1 && length($1)>0 {print $1}' | sort -u)"
+      fi
+
+      REPOS=""
+      if [ "$ROOT_HAS_FILES" -eq 1 ]; then
+        REPOS="$ROOT"
+      elif [ -n "${TOP_LEVELS:-}" ]; then
+        for top in $TOP_LEVELS; do
+          candidate="$ROOT/$top"
+          if [ -d "$candidate" ]; then
+            REPOS="$REPOS $candidate"
+          fi
+        done
+      else
+        REPOS="$ROOT"
+      fi
+
+      FAIL=0
+      for repo in $REPOS; do
+        if ! commit_repo "$repo"; then
+          echo "ERROR: git commit failed in $repo" >&2
+          FAIL=1
+        fi
+      done
+      [ "$FAIL" -eq 0 ] || exit 1
+    config:
+      match: "*"
+      timeout: "30"
+      git_user_name: "AgentFab Developer"
+      git_user_email: "developer@agentfab.local"
+  - name: web_search
+    instructions: "Search the web for technical documentation, API references, tutorials, and solutions. Use when you need information beyond what's in the project files."
+    command: |
+      curl -s "https://api.search.brave.com/res/v1/web/search?q=$(python3 -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))' "$TOOL_ARG_QUERY")&count=${TOOL_ARG_COUNT:-5}" \
+        -H "Accept: application/json" \
+        -H "X-Subscription-Token: $BRAVE_SEARCH_API_KEY" | \
+      python3 -c "
+      import json,sys
+      data = json.load(sys.stdin)
+      for r in data.get('web',{}).get('results',[]):
+          print(f'### {r[\"title\"]}')
+          print(r['url'])
+          print(r.get('description',''))
+          print()
+      "
+    parameters:
+      query:
+        type: string
+        description: "The search query"
+        required: true
+      count:
+        type: integer
+        description: "Number of results to return (default 5)"
+        required: false
+    config:
+      timeout: "15"
+    passthrough_env:
+      - BRAVE_SEARCH_API_KEY
+  - name: css-check
+    mode: post_process
+    instructions: "Validate that HTML class references have matching CSS selectors."
+    command: |
+      found_mismatch=0
+      for html_file in "$TOOL_INPUT_DIR"/*.html; do
+        [ -f "$html_file" ] || continue
+        dir="$(dirname "$html_file")"
+        css_files="$(find "$dir" -name '*.css' 2>/dev/null)"
+        [ -n "$css_files" ] || continue
+        html_classes="$(grep -oP 'class="[^"]*"' "$html_file" | sed 's/class="//;s/"//' | tr ' ' '\n' | sort -u)"
+        css_selectors="$(cat $css_files | grep -oP '\.[a-zA-Z_-][a-zA-Z0-9_-]*' | sed 's/^\.//' | sort -u)"
+        for cls in $html_classes; do
+          if ! echo "$css_selectors" | grep -qx "$cls"; then
+            echo "MISMATCH: HTML class '$cls' in $(basename "$html_file") has no matching CSS selector"
+            found_mismatch=1
+          fi
+        done
+      done
+      [ "$found_mismatch" -eq 0 ] || { echo "ERROR: HTML/CSS class mismatches found"; exit 1; }
+    config:
+      match: "*.html"
+      timeout: "15"

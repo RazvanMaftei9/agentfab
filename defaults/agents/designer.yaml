@@ -1,0 +1,92 @@
+name: designer
+purpose: "UI/UX design and user experience iteration"
+capabilities: [ui_design, ux_review, mockups]
+model: anthropic/claude-haiku-4-5-20251001
+cold_storage_retention_days: 1095
+curation_threshold: 50
+task_timeout: 30m
+tools:
+  - name: shell
+    instructions: "Execute shell commands to read and inspect files during reviews."
+    command: "$TOOL_ARG_COMMAND"
+    parameters:
+      command:
+        type: string
+        description: "The shell command to execute"
+        required: true
+    config:
+      timeout: "30"
+  - name: spec-diff
+    mode: post_process
+    instructions: "Compare CSS values (colors, fonts, spacing) against the designer spec file."
+    command: |
+      # Look for a spec/design file.
+      SPEC=""
+      for f in "$TOOL_INPUT_DIR"/spec.md "$TOOL_INPUT_DIR"/design.md "$TOOL_INPUT_DIR"/design-spec.md; do
+        [ -f "$f" ] && SPEC="$f" && break
+      done
+      if [ -z "$SPEC" ]; then
+        echo "No spec file found (spec.md, design.md, design-spec.md); skipping spec-diff"
+        exit 0
+      fi
+
+      found_mismatch=0
+
+      # Extract hex colors from spec.
+      spec_colors="$(grep -oiE '#[0-9a-fA-F]{3,8}' "$SPEC" | tr '[:upper:]' '[:lower:]' | sort -u)"
+
+      for css_file in "$TOOL_INPUT_DIR"/*.css; do
+        [ -f "$css_file" ] || continue
+        css_colors="$(grep -oiE '#[0-9a-fA-F]{3,8}' "$css_file" | tr '[:upper:]' '[:lower:]' | sort -u)"
+        for color in $css_colors; do
+          if [ -n "$spec_colors" ] && ! echo "$spec_colors" | grep -qx "$color"; then
+            echo "WARNING: Color $color in $(basename "$css_file") not found in spec"
+            found_mismatch=1
+          fi
+        done
+      done
+
+      # Extract font families from spec (quoted or unquoted).
+      spec_fonts="$(grep -oiE "(font-family|font):\s*[^;]+" "$SPEC" | sed 's/.*:\s*//' | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | tr '[:upper:]' '[:lower:]' | sort -u)"
+
+      for css_file in "$TOOL_INPUT_DIR"/*.css; do
+        [ -f "$css_file" ] || continue
+        css_fonts="$(grep -oiE "font-family:\s*[^;]+" "$css_file" | sed 's/.*:\s*//' | tr ',' '\n' | sed "s/['\"]//g;s/^[[:space:]]*//;s/[[:space:]]*$//" | tr '[:upper:]' '[:lower:]' | sort -u)"
+        for font in $css_fonts; do
+          if [ -n "$spec_fonts" ] && ! echo "$spec_fonts" | grep -qi "$font"; then
+            echo "WARNING: Font '$font' in $(basename "$css_file") not found in spec"
+            found_mismatch=1
+          fi
+        done
+      done
+
+      if [ "$found_mismatch" -eq 1 ]; then
+        echo "NOTICE: Spec differences detected (warnings above). Review manually."
+      else
+        echo "OK: No spec mismatches detected."
+      fi
+      exit 0
+    config:
+      match: "*.css"
+      timeout: "15"
+review_prompt: |
+  ## Review Protocol
+  When reviewing another agent's work:
+  - Start your response with VERDICT: approved or VERDICT: revise on its own line
+  - APPROVE if the implementation is functionally correct and visually reasonable, even if not pixel-perfect
+  - Only REVISE for issues that a user would immediately notice as wrong or broken
+  - If revising, list max 3 highest-impact issues with specific file references
+  - Do NOT flag: minor color shade differences, slightly different spacing, font weight variations, or cosmetic polish
+  - Remember: revision cycles are expensive. Reserve them for real problems.
+review_guidelines: |
+  Approve unless any of these are clearly wrong:
+  - Layout structure is fundamentally different from mockup (wrong component types, missing sections)
+  - Required features from the spec are missing or non-functional
+  - UI is broken or unusable (overlapping elements, invisible text, broken interactions)
+  - Colors or fonts are wildly off (completely different palette, not minor shade differences)
+  Do NOT flag:
+  - Minor spacing or padding differences
+  - Slight color shade variations (e.g., #1976D2 vs #1565C0)
+  - Font weight or size differences that don't affect readability
+  - CSS implementation details (class naming, selector structure)
+  - Features that work correctly but use a slightly different UI pattern than the mockup

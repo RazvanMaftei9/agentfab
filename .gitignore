@@ -24,9 +24,26 @@ profile.cov
 go.work
 go.work.sum
 
+# Built binaries
+/agentfab
+/trainos
+
+# AgentFab data (runtime)
+/agentfab-data/
+
 # env file
 .env
+
+# OS
+.DS_Store
 
 # Editor/IDE
 # .idea/
 # .vscode/
+
+# agents.yaml
+agents.yaml
+
+# Benchmark results (large, generated)
+/bench-results
+/logs

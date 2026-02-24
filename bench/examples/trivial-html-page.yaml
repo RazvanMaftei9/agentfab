@@ -1,0 +1,50 @@
+name: trivial-html-page
+description: "Simple: Single static HTML page. Baseline where single-agent should win."
+category: complexity
+complexity: simple
+request: |
+  Create a single static HTML page for a personal portfolio:
+  - Name: "Alex Johnson"
+  - Sections: Hero with name and tagline, About Me (2 paragraphs), Skills (6 items as tags/badges), Contact (email link and GitHub link)
+  - All CSS inline in a <style> tag
+  - Mobile-responsive using media queries
+  - Use a modern sans-serif font stack
+  - Color scheme: dark navy (#1a1a2e) background hero, white content area, accent color (#e94560)
+  - Single file: index.html (no external dependencies)
+runs: 3
+verify_command: none
+assertions:
+  - type: file_exists
+    path: "index.html"
+  - type: pattern_match
+    path: "index.html"
+    pattern: "Alex Johnson"
+  - type: pattern_match
+    path: "index.html"
+    pattern: "<style>"
+  - type: pattern_match
+    path: "index.html"
+    pattern: "@media|media.*max-width"
+  - type: pattern_match
+    path: "index.html"
+    pattern: "1a1a2e|e94560"
+configs:
+  - name: all-opus
+    model_overrides:
+      conductor: anthropic/claude-opus-4-5-20251101
+      architect: anthropic/claude-opus-4-5-20251101
+      designer: anthropic/claude-opus-4-5-20251101
+      developer: anthropic/claude-opus-4-5-20251101
+  - name: all-sonnet
+    model_overrides:
+      conductor: anthropic/claude-sonnet-4-5-20250929
+      architect: anthropic/claude-sonnet-4-5-20250929
+      designer: anthropic/claude-sonnet-4-5-20250929
+      developer: anthropic/claude-sonnet-4-5-20250929
+  - name: heterogeneous
+  - name: single-agent
+    single_agent: true
+  - name: no-verify
+    disable_verify: true
+  - name: adaptive-3tier
+    adaptive: true

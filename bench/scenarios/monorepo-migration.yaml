@@ -1,0 +1,69 @@
+name: monorepo-migration
+description: "Complex: JS monorepo with shared lib + 2 consuming apps. Tests dependency coordination."
+category: ablation
+complexity: complex
+request: |
+  Create a JavaScript monorepo with the following structure:
+  - packages/shared-utils/: A shared utility library with functions for:
+    - formatDate(date) - formats dates as YYYY-MM-DD
+    - slugify(text) - converts text to URL-safe slugs
+    - validateEmail(email) - validates email format
+    - truncate(text, maxLen) - truncates with ellipsis
+    Each function should have JSDoc comments and be exported from index.js.
+  - packages/web-app/: An Express.js web application that:
+    - Imports and uses shared-utils for formatting blog post slugs and dates
+    - Has routes: GET / (home), GET /posts (list), GET /posts/:slug (detail)
+    - Uses EJS templates for rendering
+    - Has a package.json that depends on shared-utils via "file:../shared-utils"
+  - packages/cli-tool/: A Node.js CLI tool that:
+    - Imports shared-utils for email validation and text truncation
+    - Accepts subcommands: validate-email <email>, slugify <text>, truncate <text> <len>
+    - Has a package.json with a bin entry pointing to cli.js
+    - Depends on shared-utils via "file:../shared-utils"
+  - Root package.json with workspaces configuration pointing to packages/*
+  Include a root README.md explaining the monorepo structure.
+runs: 3
+assertions:
+  - type: file_exists
+    path: "package.json"
+  - type: pattern_match
+    path: "package.json"
+    pattern: "workspaces"
+  - type: file_exists
+    path: "packages/shared-utils/index.js"
+  - type: file_exists
+    path: "packages/web-app/package.json"
+  - type: file_exists
+    path: "packages/cli-tool/package.json"
+  - type: pattern_match
+    path: "packages/shared-utils/index.js"
+    pattern: "formatDate|slugify|validateEmail"
+  - type: pattern_match
+    path: "packages/web-app/package.json"
+    pattern: "shared-utils"
+  - type: pattern_match
+    path: "packages/cli-tool/package.json"
+    pattern: "shared-utils"
+  - type: file_count_min
+    path: "*.js"
+    min: 4
+configs:
+  - name: all-opus
+    model_overrides:
+      conductor: anthropic/claude-opus-4-5-20251101
+      architect: anthropic/claude-opus-4-5-20251101
+      designer: anthropic/claude-opus-4-5-20251101
+      developer: anthropic/claude-opus-4-5-20251101
+  - name: all-sonnet
+    model_overrides:
+      conductor: anthropic/claude-sonnet-4-5-20250929
+      architect: anthropic/claude-sonnet-4-5-20250929
+      designer: anthropic/claude-sonnet-4-5-20250929
+      developer: anthropic/claude-sonnet-4-5-20250929
+  - name: heterogeneous
+  - name: single-agent
+    single_agent: true
+  - name: no-verify
+    disable_verify: true
+  - name: adaptive-3tier
+    adaptive: true

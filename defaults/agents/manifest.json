@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "generated_at": "2026-03-15T00:18:42Z",
+  "checksums": {
+    "architect.md": "8a8530642263d1ef7e736c5cd884b4f6d39b01f400c62c027a97060526cf8b08",
+    "architect.yaml": "e76f4dca2ca3864be82c0baf5ab74650d55a7a712c6f3e965dda1a31024397f9",
+    "conductor.md": "bde96fa51f1b30d644787c9ba0c57b3daf7e254e82b365d8d8540b2fd45e0be4",
+    "conductor.yaml": "db8c336d1bdbd8f59cbeb3358cc6e103c254fd8ecdd5e0cfe9c141f2e2a39025",
+    "designer.md": "b84b74700e9baa6f10039021e8b8ec4fef8b4c2355941966b414a40ad47defd1",
+    "designer.yaml": "b682975e0f83da7002f80848a89d772b3dccf0d7c6c41e1de522a35565adaa60",
+    "developer.md": "68903d1fe9f17d134344c50d72638c8e9db288e16f0312559d8dc55830a29181",
+    "developer.yaml": "8b6f8626e68013e737cd29942e4c27409700735348053171c6ee750e493bfe61"
+  }
+}

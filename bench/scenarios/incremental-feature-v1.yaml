@@ -1,0 +1,62 @@
+name: incremental-feature-v1
+description: "Knowledge persistence test (phase 1): Build base note-taking app."
+category: ablation
+complexity: medium
+request: |
+  Build a note-taking web application (phase 1 - base):
+  - Backend: Node.js Express API
+    - POST /api/notes - create note (title, content, tags[])
+    - GET /api/notes - list all notes
+    - GET /api/notes/:id - get single note
+    - PUT /api/notes/:id - update note
+    - DELETE /api/notes/:id - delete note
+    - In-memory storage with auto-incrementing IDs
+  - Frontend: Single HTML page with vanilla JavaScript
+    - Form to create/edit notes
+    - List view showing all notes with title preview
+    - Click note to view full content
+    - Delete button on each note
+    - Simple, clean CSS styling
+  - Files: server.js, public/index.html, public/style.css, public/app.js, package.json
+runs: 3
+assertions:
+  - type: file_exists
+    path: "server.js"
+  - type: file_exists
+    path: "package.json"
+  - type: file_exists
+    path: "*.html"
+  - type: file_exists
+    path: "*.css"
+  - type: pattern_match
+    path: "server.js"
+    pattern: "express|Express"
+  - type: pattern_match
+    path: "server.js"
+    pattern: "/api/notes"
+  - type: pattern_match
+    path: "*.js"
+    pattern: "addEventListener|fetch"
+  - type: file_count_min
+    path: "*.js"
+    min: 2
+configs:
+  - name: all-opus
+    model_overrides:
+      conductor: anthropic/claude-opus-4-5-20251101
+      architect: anthropic/claude-opus-4-5-20251101
+      designer: anthropic/claude-opus-4-5-20251101
+      developer: anthropic/claude-opus-4-5-20251101
+  - name: all-sonnet
+    model_overrides:
+      conductor: anthropic/claude-sonnet-4-5-20250929
+      architect: anthropic/claude-sonnet-4-5-20250929
+      designer: anthropic/claude-sonnet-4-5-20250929
+      developer: anthropic/claude-sonnet-4-5-20250929
+  - name: heterogeneous
+  - name: single-agent
+    single_agent: true
+  - name: no-verify
+    disable_verify: true
+  - name: adaptive-3tier
+    adaptive: true

@@ -1,0 +1,63 @@
+syntax = "proto3";
+
+package agentfab.v1;
+
+option go_package = "github.com/razvanmaftei/agentfab/gen/agentfab/v1;agentfabv1";
+
+import "google/protobuf/struct.proto";
+
+message Message {
+  string id = 1;
+  string request_id = 2;
+  string from = 3;
+  string to = 4;
+  MessageType type = 5;
+  repeated Part parts = 6;
+  map<string, string> metadata = 7;
+  TokenUsage token_usage = 8;
+  int64 timestamp = 9;
+}
+
+enum MessageType {
+  MESSAGE_TYPE_UNSPECIFIED = 0;
+  MESSAGE_TYPE_TASK_ASSIGNMENT = 1;
+  MESSAGE_TYPE_TASK_RESULT = 2;
+  MESSAGE_TYPE_ESCALATION = 3;
+  MESSAGE_TYPE_ESCALATION_RESPONSE = 4;
+  MESSAGE_TYPE_REVIEW_REQUEST = 5;
+  MESSAGE_TYPE_REVIEW_RESPONSE = 6;
+  MESSAGE_TYPE_STATUS_UPDATE = 7;
+  MESSAGE_TYPE_USER_QUERY = 8;
+  MESSAGE_TYPE_USER_RESPONSE = 9;
+}
+
+message Part {
+  oneof part {
+    TextPart text = 1;
+    FilePart file = 2;
+    DataPart data = 3;
+  }
+}
+
+message TextPart {
+  string text = 1;
+}
+
+message FilePart {
+  string uri = 1;
+  string mime_type = 2;
+  string name = 3;
+}
+
+message DataPart {
+  google.protobuf.Struct data = 1;
+}
+
+message TokenUsage {
+  int64 input_tokens = 1;
+  int64 output_tokens = 2;
+  int64 total_tokens = 3;
+  int64 total_calls = 4;
+  int64 cache_read_tokens = 5;
+  string model = 6;
+}
