@@ -2,6 +2,8 @@
 
 A distributed platform where specialized AI agents collaborate through task graphs, persistent knowledge, and bounded review loops. Define agents in YAML, each with its own LLM model, tools, and knowledge base. The framework handles decomposition, scheduling, sandboxed execution, and inter-agent communication.
 
+For a full breakdown and demos, see: https://razvanmaftei.me/article?slug=agentfab-stateful-multi-agent-orchestration
+
 ## Platforms
 
 | Platform | Sandbox | Notes |
