@@ -14,8 +14,9 @@ const maxKnowledgeLabelRunes = 56
 
 // knowledgeTree is a tree representation of knowledge nodes for CLI visualization.
 type knowledgeTree struct {
-	root     *ktNode
-	allNodes []*ktNode
+	root       *ktNode
+	allNodes   []*ktNode
+	totalNodes int
 }
 
 // ktNode is a node in the knowledge tree.
@@ -78,7 +79,7 @@ func buildKnowledgeTree(own []event.KnowledgeNodeInfo, related []event.Knowledge
 	}
 
 	sortKnowledgeChildren(root)
-	return &knowledgeTree{root: root, allNodes: allNodes}
+	return &knowledgeTree{root: root, allNodes: allNodes, totalNodes: len(own) + len(related)}
 }
 
 // sortKnowledgeChildren ensures deterministic rendering order.

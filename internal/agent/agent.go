@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -852,6 +853,16 @@ func (a *Agent) persistScratchToShared(ctx context.Context, rp *resultParts, exi
 			return nil
 		}
 
+		// Skip files that are identical copies of upstream artifacts from
+		// other agents. Without this check, files an agent reads from
+		// $SHARED_DIR/artifacts/<other-agent>/ into scratch get
+		// re-published under this agent's name.
+		if len(a.ToolExecutor.TierPaths) >= 3 {
+			if isUpstreamCopy(a.ToolExecutor.TierPaths[2], a.Def.Name, rel, data) {
+				return nil
+			}
+		}
+
 		storagePath := rp.dir + "/" + filepath.ToSlash(rel)
 		if err := a.Storage.Write(ctx, runtime.TierShared, storagePath, data); err != nil {
 			slog.Warn("failed to persist scratch file", "path", rel, "error", err)
@@ -867,6 +878,31 @@ func (a *Agent) persistScratchToShared(ctx context.Context, rp *resultParts, exi
 			"agent", a.Def.Name, "files", extra)
 	}
 	return extra
+}
+
+// isUpstreamCopy checks whether a file in scratch is an exact copy of an
+// artifact produced by a different agent. This prevents persistScratchToShared
+// from re-publishing upstream artifacts under the current agent's name.
+func isUpstreamCopy(sharedDir, agentName, relPath string, data []byte) bool {
+	artifactsDir := filepath.Join(sharedDir, "artifacts")
+	entries, err := os.ReadDir(artifactsDir)
+	if err != nil {
+		return false
+	}
+	for _, e := range entries {
+		if !e.IsDir() || e.Name() == agentName {
+			continue
+		}
+		candidate := filepath.Join(artifactsDir, e.Name(), relPath)
+		upstream, err := os.ReadFile(candidate)
+		if err != nil {
+			continue
+		}
+		if bytes.Equal(upstream, data) {
+			return true
+		}
+	}
+	return false
 }
 
 // ensureScratchFromShared copies work artifact files from shared storage into

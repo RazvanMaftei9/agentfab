@@ -333,6 +333,8 @@ func (r *Renderer) RenderRequest(bus event.Bus) {
 	r.knowledgeTree = nil
 	var tasks []event.TaskSummary
 	taskLinesDrawn := 0
+	taskBlockLines := 0
+	taskPrefixLines := 0
 	tokenMap := make(map[string]taskTokens) // taskID → tokens
 	progressMap := make(map[string]string)  // agent name → streaming snippet
 	summaryMap := make(map[string]string)   // taskID → result summary
@@ -405,9 +407,10 @@ func (r *Renderer) RenderRequest(bus event.Bus) {
 				}
 
 				if r.tty && taskLinesDrawn > 0 {
-					EraseBlock(r.w, taskLinesDrawn)
+					EraseBlock(r.w, taskBlockLines+taskPrefixLines)
 				}
 
+				taskPrefixLines = 0
 				if r.tty && e.TaskDescription != "" {
 					color := r.assignColor(e.TaskAgent)
 					desc := e.TaskDescription
@@ -420,14 +423,17 @@ func (r *Renderer) RenderRequest(bus event.Bus) {
 					fmt.Fprintf(r.w, "  %s\u25b8%s %s%s%s %s%s%s\n",
 						Cyan, Reset, Bold, e.TaskID, Reset, color, e.TaskAgent, Reset)
 					fmt.Fprintf(r.w, "    %s%s%s\n", Dim, desc, Reset)
+					taskPrefixLines = 2
 				}
 				updateTask(tasks, e.TaskID, "running")
 				agentToTask[e.TaskAgent] = e.TaskID
 
 				if r.tty {
-					taskLinesDrawn = r.drawTaskBlock(tasks, tokenMap, progressMap, summaryMap, spinnerFrame, taskLinesDrawn == 0)
+					taskBlockLines = r.drawTaskBlock(tasks, tokenMap, progressMap, summaryMap, spinnerFrame, taskLinesDrawn == 0)
+					taskLinesDrawn = taskBlockLines + taskPrefixLines
 				} else {
-					taskLinesDrawn = r.redrawTaskBlock(tasks, tokenMap, progressMap, summaryMap, spinnerFrame, 0)
+					taskBlockLines = r.redrawTaskBlock(tasks, tokenMap, progressMap, summaryMap, spinnerFrame, 0)
+					taskLinesDrawn = taskBlockLines + taskPrefixLines
 				}
 
 			case event.TaskProgress:
@@ -438,7 +444,8 @@ func (r *Renderer) RenderRequest(bus event.Bus) {
 					} else {
 						progressMap[e.TaskAgent] = e.ProgressText
 						if taskLinesDrawn > 0 {
-							taskLinesDrawn = r.redrawTaskBlock(tasks, tokenMap, progressMap, summaryMap, spinnerFrame, taskLinesDrawn)
+							taskBlockLines = r.redrawTaskBlock(tasks, tokenMap, progressMap, summaryMap, spinnerFrame, taskBlockLines)
+							taskLinesDrawn = taskBlockLines + taskPrefixLines
 						}
 					}
 				}
@@ -455,11 +462,13 @@ func (r *Renderer) RenderRequest(bus event.Bus) {
 				delete(progressMap, e.TaskAgent)
 				if r.tty {
 					if r.layout != nil && taskLinesDrawn > 0 {
-						EraseBlock(r.w, taskLinesDrawn)
+						EraseBlock(r.w, taskBlockLines+taskPrefixLines)
 						r.printEventLine("✓", r.assignColor(e.TaskAgent), e.TaskID, e.TaskAgent, e.ResultSummary, Dim, tokenMap[e.TaskID])
-						taskLinesDrawn = r.drawTaskBlock(tasks, tokenMap, progressMap, summaryMap, spinnerFrame, false)
+						taskBlockLines = r.drawTaskBlock(tasks, tokenMap, progressMap, summaryMap, spinnerFrame, false)
+						taskLinesDrawn = taskBlockLines + taskPrefixLines
 					} else {
-						taskLinesDrawn = r.redrawTaskBlock(tasks, tokenMap, progressMap, summaryMap, spinnerFrame, taskLinesDrawn)
+						taskBlockLines = r.redrawTaskBlock(tasks, tokenMap, progressMap, summaryMap, spinnerFrame, taskBlockLines)
+						taskLinesDrawn = taskBlockLines + taskPrefixLines
 					}
 				} else {
 					if s, ok := summaryMap[e.TaskID]; ok {
@@ -478,11 +487,13 @@ func (r *Renderer) RenderRequest(bus event.Bus) {
 				delete(progressMap, e.TaskAgent)
 				if r.tty {
 					if r.layout != nil && taskLinesDrawn > 0 {
-						EraseBlock(r.w, taskLinesDrawn)
+						EraseBlock(r.w, taskBlockLines+taskPrefixLines)
 						r.printEventLine("✗", Red, e.TaskID, e.TaskAgent, e.ErrMsg, Red, tokenMap[e.TaskID])
-						taskLinesDrawn = r.drawTaskBlock(tasks, tokenMap, progressMap, summaryMap, spinnerFrame, false)
+						taskBlockLines = r.drawTaskBlock(tasks, tokenMap, progressMap, summaryMap, spinnerFrame, false)
+						taskLinesDrawn = taskBlockLines + taskPrefixLines
 					} else {
-						taskLinesDrawn = r.redrawTaskBlock(tasks, tokenMap, progressMap, summaryMap, spinnerFrame, taskLinesDrawn)
+						taskBlockLines = r.redrawTaskBlock(tasks, tokenMap, progressMap, summaryMap, spinnerFrame, taskBlockLines)
+						taskLinesDrawn = taskBlockLines + taskPrefixLines
 					}
 				} else {
 					suffix := tokenSuffix(e.TaskID, tokenMap)
@@ -495,9 +506,11 @@ func (r *Renderer) RenderRequest(bus event.Bus) {
 
 			case event.LoopTransition:
 				if r.tty && taskLinesDrawn > 0 {
-					EraseBlock(r.w, taskLinesDrawn)
+					EraseBlock(r.w, taskBlockLines+taskPrefixLines)
 					r.printLoopTransition(e)
-					taskLinesDrawn = r.drawTaskBlock(tasks, tokenMap, progressMap, summaryMap, spinnerFrame, false)
+					taskPrefixLines = 1
+					taskBlockLines = r.drawTaskBlock(tasks, tokenMap, progressMap, summaryMap, spinnerFrame, false)
+					taskLinesDrawn = taskBlockLines + taskPrefixLines
 				} else {
 					r.printLoopTransition(e)
 				}
@@ -506,7 +519,8 @@ func (r *Renderer) RenderRequest(bus event.Bus) {
 				updateTask(tasks, e.AmendedTaskID, "pending")
 				delete(progressMap, e.AmendedAgent)
 				if r.tty && taskLinesDrawn > 0 {
-					taskLinesDrawn = r.redrawTaskBlock(tasks, tokenMap, progressMap, summaryMap, spinnerFrame, taskLinesDrawn)
+					taskBlockLines = r.redrawTaskBlock(tasks, tokenMap, progressMap, summaryMap, spinnerFrame, taskBlockLines)
+					taskLinesDrawn = taskBlockLines + taskPrefixLines
 				}
 
 			case event.KnowledgeLookup:
@@ -515,30 +529,22 @@ func (r *Renderer) RenderRequest(bus event.Bus) {
 					break
 				}
 				if r.tty {
-					if taskLinesDrawn > 0 {
-						EraseBlock(r.w, taskLinesDrawn)
-					}
-					color := r.assignColor(e.KnowledgeLookupAgent)
-					fmt.Fprintf(r.w, "  %s◈%s %s%s%s reading %d knowledge nodes\n",
-						Cyan, Reset, color, e.KnowledgeLookupAgent, Reset, totalNodes)
-					// Printed as permanent output to avoid scrollback duplication
-					// from re-rendering every animation frame.
+					// Build the knowledge tree and store it in the renderer so
+					// renderAnimatedBlock includes it in every frame. This avoids
+					// ghost lines that occur when the tree is printed as permanent
+					// output outside the animated block.
 					tree := buildKnowledgeTree(e.KnowledgeLookupOwnNodes, e.KnowledgeLookupRelNodes, e.KnowledgeLookupEdges)
-					if tree != nil {
-						colorFn := func(agent string) string { return r.assignColor(agent) }
-						treeLines := renderKnowledgeTreeLines(tree, e.KnowledgeLookupAgent, 0, r.width, r.tty, colorFn)
-						for _, line := range treeLines {
-							fmt.Fprintln(r.w, line)
-						}
-						if len(treeLines) > 0 {
-							fmt.Fprintln(r.w)
-						}
-					}
-					r.knowledgeTree = nil
-					if len(tasks) > 0 {
-						taskLinesDrawn = r.drawTaskBlock(tasks, tokenMap, progressMap, summaryMap, spinnerFrame, false)
-					} else {
-						taskLinesDrawn = 0
+					r.knowledgeTree = tree
+					r.knowledgeAgent = e.KnowledgeLookupAgent
+					r.knowledgeFlashTill = time.Now().Add(800 * time.Millisecond)
+					r.knowledgeFrame = 0
+					// Redraw the block — renderAnimatedBlock will now include the tree.
+					if taskLinesDrawn > 0 {
+						taskBlockLines = r.redrawTaskBlock(tasks, tokenMap, progressMap, summaryMap, spinnerFrame, taskBlockLines)
+						taskLinesDrawn = taskBlockLines + taskPrefixLines
+					} else if len(tasks) > 0 {
+						taskBlockLines = r.drawTaskBlock(tasks, tokenMap, progressMap, summaryMap, spinnerFrame, false)
+						taskLinesDrawn = taskBlockLines + taskPrefixLines
 					}
 				} else {
 					fmt.Fprintf(r.w, "  knowledge: %d own + %d related nodes for %s\n",
@@ -547,23 +553,25 @@ func (r *Renderer) RenderRequest(bus event.Bus) {
 
 			case event.CurationStarted:
 				if r.tty && taskLinesDrawn > 0 {
-					EraseBlock(r.w, taskLinesDrawn)
+					EraseBlock(r.w, taskBlockLines+taskPrefixLines)
 				}
 				if r.tty {
 					color := r.assignColor(e.CurationAgent)
 					fmt.Fprintf(r.w, "  %s◐%s %s%s%s: curating knowledge (%d nodes)...\n",
 						Cyan, Reset, color, e.CurationAgent, Reset, e.CurationNodesIn)
+					taskPrefixLines = 1
 				} else {
 					fmt.Fprintf(r.w, "CURATE %s: curating knowledge (%d nodes)\n",
 						e.CurationAgent, e.CurationNodesIn)
 				}
 				if r.tty && len(tasks) > 0 {
-					taskLinesDrawn = r.drawTaskBlock(tasks, tokenMap, progressMap, summaryMap, spinnerFrame, false)
+					taskBlockLines = r.drawTaskBlock(tasks, tokenMap, progressMap, summaryMap, spinnerFrame, false)
+					taskLinesDrawn = taskBlockLines + taskPrefixLines
 				}
 
 			case event.CurationComplete:
 				if r.tty && taskLinesDrawn > 0 {
-					EraseBlock(r.w, taskLinesDrawn)
+					EraseBlock(r.w, taskBlockLines+taskPrefixLines)
 				}
 				if r.tty {
 					color := r.assignColor(e.CurationAgent)
@@ -577,39 +585,45 @@ func (r *Renderer) RenderRequest(bus event.Bus) {
 						fmt.Fprintf(r.w, ", %d purged", e.ColdStoragePurged)
 					}
 					fmt.Fprintf(r.w, ")%s\n", Reset)
+					taskPrefixLines = 1
 				} else {
 					fmt.Fprintf(r.w, "CURATE %s: complete (%d -> %d nodes, %d archived, %d purged)\n",
 						e.CurationAgent, e.CurationNodesIn, e.CurationNodesOut,
 						e.ColdStorageMoved, e.ColdStoragePurged)
 				}
 				if r.tty && len(tasks) > 0 {
-					taskLinesDrawn = r.drawTaskBlock(tasks, tokenMap, progressMap, summaryMap, spinnerFrame, false)
+					taskBlockLines = r.drawTaskBlock(tasks, tokenMap, progressMap, summaryMap, spinnerFrame, false)
+					taskLinesDrawn = taskBlockLines + taskPrefixLines
 				}
 
 			case event.AgentSleep:
 				if r.tty && taskLinesDrawn > 0 {
-					EraseBlock(r.w, taskLinesDrawn)
+					EraseBlock(r.w, taskBlockLines+taskPrefixLines)
 				}
 				if r.tty {
 					color := r.assignColor(e.AgentName)
 					fmt.Fprintf(r.w, "  %s◌%s %s%s%s: entering sleep state\n",
 						Gray, Reset, color, e.AgentName, Reset)
+					taskPrefixLines = 1
 				}
 				if r.tty && len(tasks) > 0 {
-					taskLinesDrawn = r.drawTaskBlock(tasks, tokenMap, progressMap, summaryMap, spinnerFrame, false)
+					taskBlockLines = r.drawTaskBlock(tasks, tokenMap, progressMap, summaryMap, spinnerFrame, false)
+					taskLinesDrawn = taskBlockLines + taskPrefixLines
 				}
 
 			case event.AgentWake:
 				if r.tty && taskLinesDrawn > 0 {
-					EraseBlock(r.w, taskLinesDrawn)
+					EraseBlock(r.w, taskBlockLines+taskPrefixLines)
 				}
 				if r.tty {
 					color := r.assignColor(e.AgentName)
 					fmt.Fprintf(r.w, "  %s●%s %s%s%s: waking from sleep\n",
 						Cyan, Reset, color, e.AgentName, Reset)
+					taskPrefixLines = 1
 				}
 				if r.tty && len(tasks) > 0 {
-					taskLinesDrawn = r.drawTaskBlock(tasks, tokenMap, progressMap, summaryMap, spinnerFrame, false)
+					taskBlockLines = r.drawTaskBlock(tasks, tokenMap, progressMap, summaryMap, spinnerFrame, false)
+					taskLinesDrawn = taskBlockLines + taskPrefixLines
 				}
 
 			case event.RequestCancelled:
@@ -635,7 +649,9 @@ func (r *Renderer) RenderRequest(bus event.Bus) {
 			}
 			r.knowledgeTree = nil
 			if r.tty && taskLinesDrawn > 0 {
-				EraseBlock(r.w, taskLinesDrawn)
+				EraseBlock(r.w, taskBlockLines+taskPrefixLines)
+				taskBlockLines = 0
+				taskPrefixLines = 0
 				taskLinesDrawn = 0
 			}
 			r.pauseAckCh <- struct{}{}
@@ -645,13 +661,15 @@ func (r *Renderer) RenderRequest(bus event.Bus) {
 				spinner.Start(spinnerMsg)
 			}
 			if len(tasks) > 0 && executionHeaderDrawn {
-				taskLinesDrawn = r.drawTaskBlock(tasks, tokenMap, progressMap, summaryMap, spinnerFrame, true)
+				taskBlockLines = r.drawTaskBlock(tasks, tokenMap, progressMap, summaryMap, spinnerFrame, true)
+				taskLinesDrawn = taskBlockLines + taskPrefixLines
 			}
 
 		case <-tickerC:
 			if taskLinesDrawn > 0 && hasRunningTasks(tasks) {
 				spinnerFrame++
-				taskLinesDrawn = r.redrawTaskBlock(tasks, tokenMap, progressMap, summaryMap, spinnerFrame, taskLinesDrawn)
+				taskBlockLines = r.redrawTaskBlock(tasks, tokenMap, progressMap, summaryMap, spinnerFrame, taskBlockLines)
+				taskLinesDrawn = taskBlockLines + taskPrefixLines
 			}
 		}
 	}
@@ -733,6 +751,9 @@ func (r *Renderer) renderAnimatedBlock(tasks []event.TaskSummary, tokenMap map[s
 		} else {
 			frame = 0
 		}
+		color := r.assignColor(r.knowledgeAgent)
+		fmt.Fprintf(r.w, "  %s◈%s %s%s%s reading %d knowledge nodes\n",
+			Cyan, Reset, color, r.knowledgeAgent, Reset, r.knowledgeTree.totalNodes)
 		colorFn := func(agent string) string { return r.assignColor(agent) }
 		treeLines := renderKnowledgeTreeLines(r.knowledgeTree, r.knowledgeAgent, frame, r.width, r.tty, colorFn)
 		for _, line := range treeLines {
@@ -740,7 +761,9 @@ func (r *Renderer) renderAnimatedBlock(tasks []event.TaskSummary, tokenMap map[s
 		}
 		if len(treeLines) > 0 {
 			fmt.Fprintln(r.w) // blank separator
-			pinnedTopLines = len(treeLines) + 1
+			pinnedTopLines = len(treeLines) + 2 // +2 for header + separator
+		} else {
+			pinnedTopLines = 1 // just the header
 		}
 	}
 

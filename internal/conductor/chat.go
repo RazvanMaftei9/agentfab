@@ -4,7 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io/fs"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 
@@ -109,7 +112,8 @@ func (c *Conductor) Chat(ctx context.Context, req ChatRequest) (*ChatResponse, e
 				"If the user's message changes what you should do for this task, include on its own line:\n" +
 				"AMEND_TASK: <new task description>\n" +
 				"If the user asks for a change to your task scope or approach, emit AMEND_TASK with the updated description. " +
-				"For small, specific fixes (e.g., \"rename this variable\", \"fix the CSS\"), call the `shell` tool to make the change directly — do not AMEND_TASK for trivial edits.\n"
+				"For small, specific fixes (e.g., \"rename this variable\", \"fix the CSS\"), call the `shell` tool to make the change directly — do not AMEND_TASK for trivial edits.\n" +
+				"When making shell edits, write all changes to $SCRATCH_DIR (the working directory). $SHARED_DIR is read-only.\n"
 		}
 	} else {
 		systemPrompt += "\n## Direct Assistance Mode\n" +
@@ -118,9 +122,12 @@ func (c *Conductor) Chat(ctx context.Context, req ChatRequest) (*ChatResponse, e
 			"Answer directly. Use the `shell` tool to read files if needed.\n\n" +
 			"**For small, targeted fixes** (typo, rename, CSS tweak, single-file edit):\n" +
 			"1. Call the `shell` tool to read the relevant files (e.g., from $SHARED_DIR/artifacts/)\n" +
-			"2. Call the `shell` tool to apply changes (sed, cat with heredoc, tee, etc.)\n" +
+			"2. Copy or recreate the file under $SCRATCH_DIR, then apply your changes there.\n" +
+			"   Example: `mkdir -p $SCRATCH_DIR/src && cp $SHARED_DIR/artifacts/developer/src/App.tsx $SCRATCH_DIR/src/App.tsx && sed -i '' 's/old/new/' $SCRATCH_DIR/src/App.tsx`\n" +
+			"   IMPORTANT: $SHARED_DIR is read-only. You MUST write all changes to $SCRATCH_DIR.\n" +
 			"3. Call the `shell` tool to verify the change took effect\n" +
-			"4. Report what you changed concisely\n\n" +
+			"4. Report what you changed concisely\n" +
+			"Changes in $SCRATCH_DIR are automatically persisted back to your artifacts.\n\n" +
 			"**For new features, multi-file changes, design updates, or anything requiring multiple agents** " +
 			"(e.g., \"add dark mode\", \"add a settings page\", \"switch to Material Design\", \"implement search\"):\n" +
 			"Do NOT attempt these yourself. Instead, emit ESCALATE on its own line so the system can " +
@@ -166,6 +173,10 @@ func (c *Conductor) Chat(ctx context.Context, req ChatRequest) (*ChatResponse, e
 	resp, toolCallCount, err := c.chatGenerateWithTools(ctx, agentDef, input)
 	if err != nil {
 		return nil, fmt.Errorf("generate: %w", err)
+	}
+
+	if toolCallCount > 0 {
+		c.persistChatScratch(ctx, req.AgentName)
 	}
 
 	// Chat must stay conversational. Strip file artifacts even if the model
@@ -591,14 +602,14 @@ func stripFileBlocks(content string) (string, bool) {
 }
 
 var (
-	rePseudoToolNameCode   = regexp.MustCompile(`(?is)<tool_name>\s*([^<]+?)\s*</tool_name>\s*<tool_code>\s*(.*?)\s*</tool_code>`)
-	reAttemptToolUse       = regexp.MustCompile(`(?is)<attempt_tool_use>\s*(.*?)\s*</attempt_tool_use>`)
-	reStripAttemptToolUse  = regexp.MustCompile(`(?is)<attempt_tool_use>\s*.*?\s*</attempt_tool_use>`)
-	reStripToolUseResult   = regexp.MustCompile(`(?is)<tool_use_result>\s*.*?\s*</tool_use_result>`)
-	reStripToolNameCode    = regexp.MustCompile(`(?is)<tool_name>\s*.*?\s*</tool_name>\s*<tool_code>\s*.*?\s*</tool_code>`)
-	reStripToolNameTag     = regexp.MustCompile(`(?is)</?tool_name>`)
-	reStripToolCodeTag     = regexp.MustCompile(`(?is)</?tool_code>`)
-	reBlankLines         = regexp.MustCompile(`\n[ \t]*\n+`)
+	rePseudoToolNameCode  = regexp.MustCompile(`(?is)<tool_name>\s*([^<]+?)\s*</tool_name>\s*<tool_code>\s*(.*?)\s*</tool_code>`)
+	reAttemptToolUse      = regexp.MustCompile(`(?is)<attempt_tool_use>\s*(.*?)\s*</attempt_tool_use>`)
+	reStripAttemptToolUse = regexp.MustCompile(`(?is)<attempt_tool_use>\s*.*?\s*</attempt_tool_use>`)
+	reStripToolUseResult  = regexp.MustCompile(`(?is)<tool_use_result>\s*.*?\s*</tool_use_result>`)
+	reStripToolNameCode   = regexp.MustCompile(`(?is)<tool_name>\s*.*?\s*</tool_name>\s*<tool_code>\s*.*?\s*</tool_code>`)
+	reStripToolNameTag    = regexp.MustCompile(`(?is)</?tool_name>`)
+	reStripToolCodeTag    = regexp.MustCompile(`(?is)</?tool_code>`)
+	reBlankLines          = regexp.MustCompile(`\n[ \t]*\n+`)
 )
 
 var pseudoToolStripPatterns = []*regexp.Regexp{
@@ -710,4 +721,68 @@ func extractPseudoToolCalls(content string) []schema.ToolCall {
 	}
 
 	return calls
+}
+
+func (c *Conductor) persistChatScratch(ctx context.Context, agentName string) {
+	storage := c.StorageFactory(agentName)
+	scratchDir := storage.TierDir(runtime.TierScratch)
+
+	if _, err := os.Stat(scratchDir); err != nil {
+		return
+	}
+
+	const maxFileSize = 1 << 20 // 1MB
+	skipDirs := map[string]bool{
+		"node_modules": true, ".git": true, "dist": true, "build": true,
+		".next": true, "__pycache__": true, "vendor": true, ".cache": true,
+		"coverage": true, ".vite": true, "_requests": true, ".tool-results": true,
+	}
+
+	persisted := 0
+	artifactDir := "artifacts/" + agentName
+
+	_ = filepath.WalkDir(scratchDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		rel, relErr := filepath.Rel(scratchDir, path)
+		if relErr != nil || rel == "." {
+			return nil
+		}
+		if d.IsDir() {
+			if skipDirs[strings.ToLower(d.Name())] {
+				return fs.SkipDir
+			}
+			return nil
+		}
+
+		// Skip hidden files, logs, and sandbox temp files.
+		base := filepath.Base(rel)
+		if strings.HasPrefix(base, ".") {
+			return nil
+		}
+
+		info, infoErr := d.Info()
+		if infoErr != nil || info.Size() > maxFileSize || info.Size() == 0 {
+			return nil
+		}
+
+		data, readErr := os.ReadFile(path)
+		if readErr != nil {
+			return nil
+		}
+
+		storagePath := artifactDir + "/" + filepath.ToSlash(rel)
+		if err := storage.Write(ctx, runtime.TierShared, storagePath, data); err != nil {
+			slog.Warn("failed to persist chat scratch file", "path", rel, "error", err)
+		} else {
+			persisted++
+		}
+		return nil
+	})
+
+	if persisted > 0 {
+		slog.Info("persisted chat scratch files to shared storage",
+			"agent", agentName, "files", persisted)
+	}
 }

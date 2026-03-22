@@ -358,8 +358,8 @@ func TestRenderRequestTTYClearsStaleGraphFrames(t *testing.T) {
 	if !strings.Contains(screen, "t2") || !strings.Contains(screen, "designer") {
 		t.Fatalf("expected updated graph content in final screen:\n%s", screen)
 	}
-	if !strings.Contains(screen, "✓ t1") {
-		t.Fatalf("expected completion event line in final screen:\n%s", screen)
+	if !strings.Contains(screen, "✓ completed") {
+		t.Fatalf("expected completed status in DAG:\n%s", screen)
 	}
 }
 

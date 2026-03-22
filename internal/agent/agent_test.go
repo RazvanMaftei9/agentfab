@@ -3932,6 +3932,77 @@ func TestPersistScratchToShared(t *testing.T) {
 	}
 }
 
+func TestPersistScratchSkipsUpstreamCopies(t *testing.T) {
+	baseDir := t.TempDir()
+	scratchDir := t.TempDir()
+
+	// Use a developer-scoped storage to write the upstream artifact,
+	// then create a designer-scoped storage sharing the same base dir.
+	devStorage := local.NewStorage(baseDir, "developer")
+	ctx := context.Background()
+	upstreamContent := []byte(`export default function App() { return <div/> }`)
+	if err := devStorage.Write(ctx, runtime.TierShared, "artifacts/developer/src/App.tsx", upstreamContent); err != nil {
+		t.Fatal(err)
+	}
+
+	storage := local.NewStorage(baseDir, "designer")
+
+	// Designer's scratch has both its own file AND a copy of the developer's file.
+	files := map[string]struct {
+		content string
+	}{
+		"styles/main.css": {content: "body { color: red }"},                              // designer's own work
+		"src/App.tsx":      {content: string(upstreamContent)},                            // exact copy of upstream
+		"src/Modified.tsx": {content: `export default function App() { return <span/> }`}, // modified — should be kept
+	}
+	for relPath, f := range files {
+		full := filepath.Join(scratchDir, relPath)
+		os.MkdirAll(filepath.Dir(full), 0755)
+		os.WriteFile(full, []byte(f.content), 0644)
+	}
+
+	ag := &Agent{
+		Def:     runtime.AgentDefinition{Name: "designer"},
+		Storage: storage,
+		ToolExecutor: &ToolExecutor{
+			TierPaths: []string{scratchDir, t.TempDir(), storage.SharedDir()},
+		},
+	}
+
+	rp := &resultParts{dir: "artifacts/designer"}
+	extra := ag.persistScratchToShared(ctx, rp, nil)
+
+	// Should persist: styles/main.css and src/Modified.tsx (2 files)
+	// Should NOT persist: src/App.tsx (identical to developer's upstream artifact)
+	if extra != 2 {
+		t.Errorf("expected 2 extra files (skipping upstream copy), got %d; files: %v", extra, rp.files)
+	}
+
+	// Verify the upstream copy was NOT published under designer.
+	_, err := storage.Read(ctx, runtime.TierShared, "artifacts/designer/src/App.tsx")
+	if err == nil {
+		t.Error("upstream copy src/App.tsx should not have been persisted under designer")
+	}
+
+	// Verify the designer's own file was persisted.
+	data, err := storage.Read(ctx, runtime.TierShared, "artifacts/designer/styles/main.css")
+	if err != nil {
+		t.Fatalf("designer's own file not persisted: %v", err)
+	}
+	if string(data) != "body { color: red }" {
+		t.Errorf("unexpected content: %s", data)
+	}
+
+	// Verify the modified file was persisted (not an exact copy).
+	data, err = storage.Read(ctx, runtime.TierShared, "artifacts/designer/src/Modified.tsx")
+	if err != nil {
+		t.Fatalf("modified file not persisted: %v", err)
+	}
+	if !strings.Contains(string(data), "<span/>") {
+		t.Errorf("unexpected content: %s", data)
+	}
+}
+
 func TestDetectProjectRoot(t *testing.T) {
 	tests := []struct {
 		name     string

@@ -95,7 +95,9 @@ func buildSBPL(cfg Config, policy Policy) string {
 	// Allow writes only to the dedicated TMPDIR injected by sandbox.Run.
 	sb.WriteString("; Temp directory access\n")
 	sb.WriteString("(allow file-read* file-write*\n")
-	sb.WriteString(fmt.Sprintf("  (subpath %q)\n", absPath(sandboxTempDir())))
+	for _, p := range absPaths(sandboxTempDir()) {
+		sb.WriteString(fmt.Sprintf("  (subpath %q)\n", p))
+	}
 	sb.WriteString(")\n\n")
 
 	// Allow Homebrew paths (commonly needed for developer tools).
@@ -120,8 +122,9 @@ func buildSBPL(cfg Config, policy Policy) string {
 		sb.WriteString("; Agent read-write paths\n")
 		sb.WriteString("(allow file-read* file-write*\n")
 		for _, p := range policy.ReadWrite {
-			abs := absPath(p)
-			sb.WriteString(fmt.Sprintf("  (subpath %q)\n", abs))
+			for _, ap := range absPaths(p) {
+				sb.WriteString(fmt.Sprintf("  (subpath %q)\n", ap))
+			}
 		}
 		sb.WriteString(")\n\n")
 	}
@@ -131,8 +134,9 @@ func buildSBPL(cfg Config, policy Policy) string {
 		sb.WriteString("; Agent read-only paths\n")
 		sb.WriteString("(allow file-read*\n")
 		for _, p := range policy.ReadOnly {
-			abs := absPath(p)
-			sb.WriteString(fmt.Sprintf("  (subpath %q)\n", abs))
+			for _, ap := range absPaths(p) {
+				sb.WriteString(fmt.Sprintf("  (subpath %q)\n", ap))
+			}
 		}
 		sb.WriteString(")\n\n")
 	}
@@ -140,7 +144,11 @@ func buildSBPL(cfg Config, policy Policy) string {
 	// WorkDir always gets read-write access.
 	if cfg.WorkDir != "" {
 		sb.WriteString("; Work directory\n")
-		sb.WriteString(fmt.Sprintf("(allow file-read* file-write* (subpath %q))\n\n", absPath(cfg.WorkDir)))
+		sb.WriteString("(allow file-read* file-write*\n")
+		for _, ap := range absPaths(cfg.WorkDir) {
+			sb.WriteString(fmt.Sprintf("  (subpath %q)\n", ap))
+		}
+		sb.WriteString(")\n\n")
 	}
 
 	// Ancestor directories need stat-only access so tools that walk up
@@ -155,18 +163,18 @@ func buildSBPL(cfg Config, policy Policy) string {
 	subpathPaths = append(subpathPaths, detectToolchainPaths()...)
 	// Policy RW.
 	for _, p := range policy.ReadWrite {
-		subpathPaths = append(subpathPaths, absPath(p))
+		subpathPaths = append(subpathPaths, absPaths(p)...)
 	}
 	// Policy RO.
 	for _, p := range policy.ReadOnly {
-		subpathPaths = append(subpathPaths, absPath(p))
+		subpathPaths = append(subpathPaths, absPaths(p)...)
 	}
 	// WorkDir.
 	if cfg.WorkDir != "" {
-		subpathPaths = append(subpathPaths, absPath(cfg.WorkDir))
+		subpathPaths = append(subpathPaths, absPaths(cfg.WorkDir)...)
 	}
 	// Dedicated temp dir.
-	subpathPaths = append(subpathPaths, absPath(sandboxTempDir()))
+	subpathPaths = append(subpathPaths, absPaths(sandboxTempDir())...)
 
 	if ancestors := ancestorPaths(subpathPaths); len(ancestors) > 0 {
 		sb.WriteString("; Ancestor directories (stat-only for module resolution)\n")
@@ -194,4 +202,24 @@ func absPath(p string) string {
 		return resolved
 	}
 	return abs
+}
+
+// absPaths returns both the resolved and unresolved absolute paths for a path.
+// On macOS, symlinks like /tmp → /private/tmp and /var → /private/var mean
+// a process might reference either form. sandbox-exec matches against the
+// canonical path, but some tools construct paths using the unresolved form.
+// Emitting both ensures the SBPL policy covers both access patterns.
+func absPaths(p string) []string {
+	abs, err := filepath.Abs(p)
+	if err != nil {
+		return []string{p}
+	}
+	resolved, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		return []string{abs}
+	}
+	if resolved == abs {
+		return []string{abs}
+	}
+	return []string{resolved, abs}
 }

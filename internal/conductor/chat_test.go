@@ -2,6 +2,8 @@ package conductor
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/cloudwego/eino/components/model"
@@ -704,6 +706,95 @@ func TestChatExecutesPseudoToolMarkupFallback(t *testing.T) {
 	if callCount < 2 {
 		t.Fatalf("expected at least 2 model calls, got %d", callCount)
 	}
+}
+
+func TestPersistChatScratch(t *testing.T) {
+	dir := t.TempDir()
+	td := config.DefaultFabricDef("test")
+
+	mockFactory := func(ctx context.Context, modelID string) (model.ChatModel, error) {
+		return &mockChatModel{
+			generateFn: func(ctx context.Context, input []*schema.Message, opts ...model.Option) (*schema.Message, error) {
+				return &schema.Message{Role: schema.Assistant, Content: "ok"}, nil
+			},
+		}, nil
+	}
+
+	c, _ := New(td, dir, mockFactory, nil)
+	ctx := context.Background()
+	if err := c.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer c.Shutdown(ctx)
+
+	// Simulate an agent writing a file to its scratch directory.
+	storage := c.StorageFactory("developer")
+	scratchDir := storage.TierDir(runtime.TierScratch)
+	os.MkdirAll(filepath.Join(scratchDir, "src"), 0755)
+	if err := os.WriteFile(filepath.Join(scratchDir, "src", "App.tsx"), []byte("export default function App() {}"), 0644); err != nil {
+		t.Fatalf("write scratch file: %v", err)
+	}
+
+	// Call persistChatScratch.
+	c.persistChatScratch(ctx, "developer")
+
+	// Verify the file was persisted to shared storage.
+	sharedDir := storage.TierDir(runtime.TierShared)
+	persistedPath := filepath.Join(sharedDir, "artifacts", "developer", "src", "App.tsx")
+	data, err := os.ReadFile(persistedPath)
+	if err != nil {
+		t.Fatalf("expected persisted file at %s: %v", persistedPath, err)
+	}
+	if string(data) != "export default function App() {}" {
+		t.Errorf("persisted content = %q", string(data))
+	}
+
+	// Clean up scratch to avoid interfering with other tests.
+	os.RemoveAll(scratchDir)
+}
+
+func TestPersistChatScratchSkipsHiddenFiles(t *testing.T) {
+	dir := t.TempDir()
+	td := config.DefaultFabricDef("test")
+
+	mockFactory := func(ctx context.Context, modelID string) (model.ChatModel, error) {
+		return &mockChatModel{
+			generateFn: func(ctx context.Context, input []*schema.Message, opts ...model.Option) (*schema.Message, error) {
+				return &schema.Message{Role: schema.Assistant, Content: "ok"}, nil
+			},
+		}, nil
+	}
+
+	c, _ := New(td, dir, mockFactory, nil)
+	ctx := context.Background()
+	if err := c.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer c.Shutdown(ctx)
+
+	storage := c.StorageFactory("developer")
+	scratchDir := storage.TierDir(runtime.TierScratch)
+	os.MkdirAll(scratchDir, 0755)
+
+	// Write a hidden file and a normal file.
+	os.WriteFile(filepath.Join(scratchDir, ".sandbox-out-12345"), []byte("noise"), 0644)
+	os.WriteFile(filepath.Join(scratchDir, "index.ts"), []byte("console.log('hi')"), 0644)
+
+	c.persistChatScratch(ctx, "developer")
+
+	sharedDir := storage.TierDir(runtime.TierShared)
+
+	// Normal file should be persisted.
+	if _, err := os.Stat(filepath.Join(sharedDir, "artifacts", "developer", "index.ts")); err != nil {
+		t.Error("expected index.ts to be persisted")
+	}
+
+	// Hidden file should NOT be persisted.
+	if _, err := os.Stat(filepath.Join(sharedDir, "artifacts", "developer", ".sandbox-out-12345")); err == nil {
+		t.Error("hidden file should not be persisted")
+	}
+
+	os.RemoveAll(scratchDir)
 }
 
 func TestParseChatEscalation(t *testing.T) {
