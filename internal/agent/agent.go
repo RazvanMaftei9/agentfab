@@ -222,7 +222,7 @@ func (a *Agent) generateWithTools(ctx context.Context, input []*schema.Message, 
 	verifyStreak := 0                 // consecutive verification-only iterations
 	toolCallCount := 0                // total tool calls executed across all iterations
 	verifyAttempt := 0                // verification retry counter
-	shellRedirCount := 0           // ShellOnly file-block redirect counter (max 2)
+	shellRedirCount := 0              // ShellOnly file-block redirect counter (max 2)
 
 	for i := 0; i < maxIter; i++ {
 		// Budget check between iterations.
@@ -853,10 +853,6 @@ func (a *Agent) persistScratchToShared(ctx context.Context, rp *resultParts, exi
 			return nil
 		}
 
-		// Skip files that are identical copies of upstream artifacts from
-		// other agents. Without this check, files an agent reads from
-		// $SHARED_DIR/artifacts/<other-agent>/ into scratch get
-		// re-published under this agent's name.
 		if len(a.ToolExecutor.TierPaths) >= 3 {
 			if isUpstreamCopy(a.ToolExecutor.TierPaths[2], a.Def.Name, rel, data) {
 				return nil
@@ -1466,7 +1462,7 @@ func (a *Agent) executeTask(ctx context.Context, msg *message.Message) error {
 }
 
 type resultParts struct {
-	parts         []message.Part
+	parts []message.Part
 	dir   string
 	files []string
 }
