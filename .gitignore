@@ -47,3 +47,7 @@ agents.yaml
 # Benchmark results (large, generated)
 /bench-results
 /logs
+
+# Claude
+/claude
+CLAUDE.md

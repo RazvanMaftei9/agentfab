@@ -32,7 +32,7 @@ Once the interactive prompt loads, enter your project idea to watch the Conducto
 
 ## Default Agents
 
-agentfab provides three default agents out of the box: `Architect`, `Designer`, and `Developer`.
+Besides the Conductor, agentfab provides three default agents out of the box: `Architect`, `Designer`, and `Developer`.
 
 Agents use `provider/model-id` format (e.g. `anthropic/claude-sonnet-4-5-20250929`, `openai/gpt-5.2`). Set the key for whichever providers your agents reference.
 
