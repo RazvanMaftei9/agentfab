@@ -11,28 +11,40 @@ import (
 )
 
 var _ runtime.Storage = (*Storage)(nil)
+var _ runtime.StorageMaterializer = (*Storage)(nil)
 
 type Storage struct {
 	agentName string
-	baseDir   string // e.g., ./system-data
+	layout    runtime.StorageLayout
 }
 
 // NewStorage creates a local filesystem storage rooted at baseDir.
 // agentName scopes shared-volume writes to artifacts/{agentName}/.
 func NewStorage(baseDir, agentName string) *Storage {
-	return &Storage{baseDir: baseDir, agentName: agentName}
+	return NewStorageWithLayout(runtime.StorageLayout{
+		SharedRoot:  filepath.Join(baseDir, "shared"),
+		AgentRoot:   filepath.Join(baseDir, "agents"),
+		ScratchRoot: os.TempDir(),
+	}, agentName)
+}
+
+func NewStorageWithLayout(layout runtime.StorageLayout, agentName string) *Storage {
+	return &Storage{
+		agentName: agentName,
+		layout:    layout,
+	}
 }
 
 func (s *Storage) tierPath(tier runtime.StorageTier) string {
 	switch tier {
 	case runtime.TierShared:
-		return filepath.Join(s.baseDir, "shared")
+		return s.layout.SharedRoot
 	case runtime.TierAgent:
-		return filepath.Join(s.baseDir, "agents", s.agentName)
+		return filepath.Join(s.layout.AgentRoot, s.agentName)
 	case runtime.TierScratch:
-		return filepath.Join(os.TempDir(), "agentfab-"+s.agentName)
+		return filepath.Join(s.layout.ScratchRoot, "agentfab-"+s.agentName)
 	default:
-		return filepath.Join(s.baseDir, "shared")
+		return s.layout.SharedRoot
 	}
 }
 
@@ -141,12 +153,56 @@ func (s *Storage) List(_ context.Context, tier runtime.StorageTier, pattern stri
 	return result, nil
 }
 
+func (s *Storage) ListAll(_ context.Context, tier runtime.StorageTier, prefix string) ([]string, error) {
+	base := s.tierPath(tier)
+	if err := os.MkdirAll(base, 0755); err != nil {
+		return nil, err
+	}
+
+	prefix = filepath.ToSlash(strings.Trim(filepath.Clean(prefix), "/"))
+	if prefix == "." {
+		prefix = ""
+	}
+
+	var result []string
+	err := filepath.WalkDir(base, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		rel, err := filepath.Rel(base, path)
+		if err != nil {
+			return err
+		}
+		rel = filepath.ToSlash(rel)
+		if prefix != "" && rel != prefix && !strings.HasPrefix(rel, prefix+"/") {
+			return nil
+		}
+		result = append(result, rel)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
 func (s *Storage) SharedDir() string {
 	return s.tierPath(runtime.TierShared)
 }
 
 func (s *Storage) TierDir(tier runtime.StorageTier) string {
 	return s.tierPath(tier)
+}
+
+func (s *Storage) Materialize(_ context.Context, tier runtime.StorageTier) (runtime.MaterializedTier, error) {
+	root := s.tierPath(tier)
+	if err := os.MkdirAll(root, 0755); err != nil {
+		return nil, err
+	}
+	return directTier{path: root}, nil
 }
 
 func (s *Storage) checkDeleteScope(tier runtime.StorageTier) error {
@@ -186,4 +242,24 @@ func (s *Storage) Exists(_ context.Context, tier runtime.StorageTier, path strin
 		return false, nil
 	}
 	return err == nil, err
+}
+
+type directTier struct {
+	path string
+}
+
+func (d directTier) Path() string {
+	return d.path
+}
+
+func (d directTier) Refresh(context.Context) error {
+	return nil
+}
+
+func (d directTier) Sync(context.Context) error {
+	return nil
+}
+
+func (d directTier) Close() error {
+	return nil
 }

@@ -1,7 +1,7 @@
 name: architect
 purpose: "High-level system architecture: technology stack, component boundaries, and data model."
 capabilities: [design_docs, code_review, arch_analysis, integration_testing]
-model: openai/gpt-5.2
+model: openai/gpt-5.4
 cold_storage_retention_days: 1095
 curation_threshold: 50
 tools:

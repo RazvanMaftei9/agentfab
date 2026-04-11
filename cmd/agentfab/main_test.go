@@ -35,6 +35,16 @@ func TestParseInteractionMode(t *testing.T) {
 	}
 }
 
+func TestDefaultRootArgs(t *testing.T) {
+	if got := defaultRootArgs(nil); len(got) != 1 || got[0] != "run" {
+		t.Fatalf("defaultRootArgs(nil) = %v, want [run]", got)
+	}
+
+	if got := defaultRootArgs([]string{"run"}); got != nil {
+		t.Fatalf("defaultRootArgs(non-empty) = %v, want nil", got)
+	}
+}
+
 func TestParseDirectAgentCommandAsk(t *testing.T) {
 	cmd, matched, err := parseDirectAgentCommand("/ask developer what changed?")
 	if err != nil {

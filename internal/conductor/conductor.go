@@ -14,10 +14,12 @@ import (
 	"github.com/cloudwego/eino/components/model"
 	"github.com/cloudwego/eino/schema"
 	"github.com/google/uuid"
-	"github.com/razvanmaftei/agentfab/internal/cluster"
 	"github.com/razvanmaftei/agentfab/internal/config"
+	"github.com/razvanmaftei/agentfab/internal/controlplane"
+	"github.com/razvanmaftei/agentfab/internal/controlplanesvc"
 	"github.com/razvanmaftei/agentfab/internal/event"
 	agentgrpc "github.com/razvanmaftei/agentfab/internal/grpc"
+	"github.com/razvanmaftei/agentfab/internal/identity"
 	"github.com/razvanmaftei/agentfab/internal/knowledge"
 	"github.com/razvanmaftei/agentfab/internal/llm"
 	"github.com/razvanmaftei/agentfab/internal/local"
@@ -48,46 +50,95 @@ func WithStorageFactory(f func(string) runtime.Storage) Option {
 	return func(c *Conductor) { c.StorageFactory = f }
 }
 
-func WithDistributed() Option {
-	return func(c *Conductor) { c.Distributed = true }
-}
-
 func WithConductorListenAddr(addr string) Option {
 	return func(c *Conductor) { c.ConductorListenAddr = addr }
+}
+
+func WithConductorAdvertiseAddr(addr string) Option {
+	return func(c *Conductor) { c.ConductorAdvertiseAddr = addr }
+}
+
+func WithControlPlaneAddress(addr string) Option {
+	return func(c *Conductor) { c.ControlPlaneAddress = addr }
 }
 
 func WithDebugLog(d *llm.DebugStore) Option {
 	return func(c *Conductor) { c.DebugLog = d }
 }
 
+func WithControlPlaneStore(store controlplane.Store) Option {
+	return func(c *Conductor) { c.ControlPlane = store }
+}
+
+func WithConductorID(id string) Option {
+	return func(c *Conductor) { c.ConductorID = id }
+}
+
+func WithExternalAgents() Option {
+	return func(c *Conductor) { c.ExternalAgents = true }
+}
+
+func WithIdentityProvider(provider identity.CertificateProvider) Option {
+	return func(c *Conductor) { c.IdentityProvider = provider }
+}
+
+func WithNodeAttestor(attestor identity.Attestor) Option {
+	return func(c *Conductor) { c.NodeAttestor = attestor }
+}
+
+func WithBundleDigests(bundleDigest string, profileDigests map[string]string) Option {
+	return func(c *Conductor) {
+		c.BundleDigest = bundleDigest
+		c.ProfileDigests = cloneStringMap(profileDigests)
+	}
+}
+
 var ErrRequestCancelled = fmt.Errorf("request cancelled by user")
+
+const (
+	controlPlaneLeaderTTL         = 15 * time.Second
+	controlPlaneHeartbeatInterval = 5 * time.Second
+)
 
 // ModelFactory creates a ChatModel from a model ID string.
 type ModelFactory func(ctx context.Context, modelID string) (model.ChatModel, error)
 
 // Conductor orchestrates a fabric: setup, decomposition, scheduling, user I/O.
 type Conductor struct {
-	FabricDef      *config.FabricDef
-	BaseDir        string
-	CommFactory    message.CommunicatorFactory
-	Comm           message.MessageCommunicator
-	Discovery      runtime.Discovery
-	Lifecycle      runtime.Lifecycle
-	Meter          runtime.ExtendedMeter
-	StorageFactory func(agentName string) runtime.Storage
-	Logger         *message.Logger
-	ModelFactory   ModelFactory
-	Events         event.Bus
-	DebugLog       *llm.DebugStore     // Optional; set before Start().
-	Templates      []DecomposeTemplate // Decomposition templates loaded from defaults.
+	FabricDef        *config.FabricDef
+	BaseDir          string
+	CommFactory      message.CommunicatorFactory
+	Comm             message.MessageCommunicator
+	Discovery        runtime.Discovery
+	Lifecycle        runtime.Lifecycle
+	Meter            runtime.ExtendedMeter
+	StorageFactory   func(agentName string) runtime.Storage
+	StorageLayout    runtime.StorageLayout
+	Logger           *message.Logger
+	ModelFactory     ModelFactory
+	Events           event.Bus
+	DebugLog         *llm.DebugStore     // Optional; set before Start().
+	Templates        []DecomposeTemplate // Decomposition templates loaded from defaults.
+	ControlPlane     controlplane.Store
+	ConductorID      string
+	ExternalAgents   bool
+	IdentityProvider identity.CertificateProvider
+	NodeAttestor     identity.Attestor
+	BundleDigest     string
+	ProfileDigests   map[string]string
 
-	// Distributed enables distributed mode where agents run as separate OS
-	// processes communicating via gRPC.
-	Distributed bool
-
-	// ConductorListenAddr is the gRPC listen address for the conductor
-	// in distributed mode. Defaults to ":50050".
+	// ConductorListenAddr is the gRPC listen address for the conductor in
+	// external-node mode. Defaults to ":50050".
 	ConductorListenAddr string
+
+	// ConductorAdvertiseAddr is the reachable runtime endpoint registered in the
+	// control plane for node-hosted agents and distributed peers.
+	ConductorAdvertiseAddr string
+
+	// ControlPlaneAddress is the reachable address of an external control-plane
+	// API. When set, the conductor uses that service instead of hosting the
+	// control-plane API itself.
+	ControlPlaneAddress string
 
 	// SkipDisambiguation bypasses the requirement-clarity check before decomposition.
 	// Set to true for headless/benchmark runners that have no user to answer queries.
@@ -108,6 +159,8 @@ type Conductor struct {
 	backgroundCtx    context.Context
 	cancelBackground context.CancelFunc
 	knowledgeWg      sync.WaitGroup
+	controlPlaneMu   sync.RWMutex
+	leaderLease      *controlplane.LeaderLease
 
 	mu                sync.RWMutex
 	activeScheduler   *Scheduler
@@ -122,7 +175,8 @@ type Conductor struct {
 	sleepCancel     context.CancelFunc
 
 	shutdownOnce        sync.Once
-	conductorGRPCServer interface{ Stop() } // gRPC server for distributed mode (nil in local mode)
+	conductorGRPCServer interface{ Stop() } // gRPC server for external-node mode (nil in local mode)
+	distributedIdentity *identity.ManagedCertificate
 	shutdownErr         error
 }
 
@@ -131,28 +185,58 @@ func New(systemDef *config.FabricDef, baseDir string, factory ModelFactory, even
 	hub := local.NewHub()
 	meter := local.NewMeter()
 	backgroundCtx, cancelBackground := context.WithCancel(context.Background())
+	storageLayout := config.StorageLayout(systemDef, baseDir)
 
 	c := &Conductor{
-		FabricDef:   systemDef,
-		BaseDir:     baseDir,
-		CommFactory: hub,
-		Discovery:   local.NewDiscovery(),
-		Lifecycle:   local.NewLifecycle(),
-		Meter:       meter,
+		FabricDef:     systemDef,
+		BaseDir:       baseDir,
+		CommFactory:   hub,
+		Discovery:     local.NewDiscovery(),
+		Lifecycle:     local.NewLifecycle(),
+		Meter:         meter,
+		StorageLayout: storageLayout,
 		StorageFactory: func(name string) runtime.Storage {
-			return local.NewStorage(baseDir, name)
+			return local.NewStorageWithLayout(storageLayout, name)
 		},
 		ModelFactory:     factory,
 		Events:           events,
 		backgroundCtx:    backgroundCtx,
 		cancelBackground: cancelBackground,
+		ConductorID:      "conductor",
 	}
 
 	for _, opt := range opts {
 		opt(c)
 	}
 
-	if c.Distributed {
+	if c.StorageFactory == nil {
+		c.StorageFactory = func(name string) runtime.Storage {
+			return local.NewStorageWithLayout(c.StorageLayout, name)
+		}
+	}
+
+	if c.ControlPlane == nil {
+		storeOptions, err := controlplane.BackendOptionsFromFabric(systemDef, baseDir)
+		if err != nil {
+			return nil, fmt.Errorf("build control plane options: %w", err)
+		}
+		store, err := controlplane.NewStore(storeOptions)
+		if err != nil {
+			return nil, fmt.Errorf("create control plane store: %w", err)
+		}
+		c.ControlPlane = store
+	}
+
+	if c.BundleDigest == "" || len(c.ProfileDigests) == 0 {
+		fingerprint, err := config.ComputeBundleFingerprint(systemDef)
+		if err != nil {
+			return nil, fmt.Errorf("compute fabric bundle fingerprint: %w", err)
+		}
+		c.BundleDigest = fingerprint.BundleDigest
+		c.ProfileDigests = cloneStringMap(fingerprint.ProfileDigests)
+	}
+
+	if c.ExternalAgents {
 		if err := c.setupDistributed(); err != nil {
 			return nil, fmt.Errorf("distributed setup: %w", err)
 		}
@@ -168,34 +252,57 @@ func New(systemDef *config.FabricDef, baseDir string, factory ModelFactory, even
 	return c, nil
 }
 
-// setupDistributed replaces local infra with gRPC-backed implementations.
-// An ephemeral cluster CA is created in memory; the private key never leaves
-// the conductor process.
+// setupDistributed wires the conductor for external-node mode: gRPC transport
+// with mTLS, control-plane-backed discovery, and workload identity issued from
+// the configured certificate provider.
 func (c *Conductor) setupDistributed() error {
 	listenAddr := c.ConductorListenAddr
 	if listenAddr == "" {
 		listenAddr = ":50050"
 	}
 
-	ca, err := agentgrpc.NewClusterCA()
+	provider, err := c.distributedIdentityProvider()
 	if err != nil {
-		return fmt.Errorf("create cluster CA: %w", err)
+		return err
 	}
 
-	conductorCert, err := ca.IssueCert("conductor")
+	advertiseAddr := c.resolveConfiguredConductorAdvertiseAddr(listenAddr)
+	managedIdentity, err := identity.NewManagedCertificate(context.Background(), provider, c.conductorIdentityRequest(listenAddr, advertiseAddr))
 	if err != nil {
-		return fmt.Errorf("issue conductor certificate: %w", err)
+		return fmt.Errorf("issue conductor identity: %w", err)
 	}
-	serverTLS := agentgrpc.ServerTLSConfig(conductorCert, ca.Pool())
-	clientTLS := agentgrpc.ClientTLSConfig(conductorCert, ca.Pool())
+	c.distributedIdentity = managedIdentity
+	serverTLS := managedIdentity.ServerTLS()
+	clientTLS := managedIdentity.ClientTLS()
+	controlPlaneAddress := c.controlPlaneAPIAddress()
+	remoteControlPlane := controlPlaneAddress != ""
 
-	discovery := agentgrpc.NewStaticDiscovery()
+	if remoteControlPlane {
+		if closer, ok := c.ControlPlane.(interface{ Close() error }); ok {
+			if err := closer.Close(); err != nil {
+				return fmt.Errorf("close local control plane store: %w", err)
+			}
+		}
+		c.ControlPlane = controlplane.NewRemoteClient(controlPlaneAddress, clientTLS)
+	}
+
+	attestor := c.nodeAttestor()
+	discovery := controlplane.NewDiscovery(c.ControlPlane)
 	c.Discovery = discovery
 	c.CommFactory = agentgrpc.NewCommFactory(discovery, serverTLS, clientTLS)
 
-	conductorSrv, srvErr := agentgrpc.NewServer("conductor", listenAddr, 64, serverTLS)
-	if srvErr != nil {
-		return fmt.Errorf("create conductor gRPC server: %w", srvErr)
+	conductorSrv, err := agentgrpc.NewServer("conductor", listenAddr, 64, serverTLS)
+	if err != nil {
+		return fmt.Errorf("create conductor gRPC server: %w", err)
+	}
+	if !remoteControlPlane {
+		conductorSrv.SetControlPlaneService(controlplanesvc.New(controlplanesvc.Config{
+			Store:                  c.ControlPlane,
+			Fabric:                 c.FabricDef.Fabric.Name,
+			ExpectedBundleDigest:   c.BundleDigest,
+			ExpectedProfileDigests: cloneStringMap(c.ProfileDigests),
+			Attestor:               attestor,
+		}))
 	}
 	go func() {
 		if err := conductorSrv.Serve(); err != nil {
@@ -203,30 +310,78 @@ func (c *Conductor) setupDistributed() error {
 		}
 	}()
 
-	actualAddr := conductorSrv.Addr()
-	_, port, _ := net.SplitHostPort(actualAddr)
-	conductorAddr := "localhost:" + port
+	c.ConductorAdvertiseAddr = actualConductorAddress(conductorSrv.Addr(), listenAddr, advertiseAddr)
 
-	discovery.Register(context.Background(), "conductor", runtime.Endpoint{Address: conductorAddr})
 	c.Comm = agentgrpc.NewCommunicator("conductor", conductorSrv, discovery, clientTLS)
-
-	configFile := filepath.Join(c.BaseDir, "shared", "agents.yaml")
-	lifecycle := agentgrpc.NewProcessLifecycle(configFile, c.BaseDir, conductorAddr, discovery)
-	lifecycle.SetCA(ca)
-	if c.DebugLog != nil {
-		lifecycle.SetDebug(true)
-	}
-	c.Lifecycle = lifecycle
-
+	c.Lifecycle = runtime.NewNoopLifecycle()
 	c.conductorGRPCServer = conductorSrv
-
 	return nil
+}
+
+func (c *Conductor) controlPlaneAPIAddress() string {
+	if strings.TrimSpace(c.ControlPlaneAddress) != "" {
+		return strings.TrimSpace(c.ControlPlaneAddress)
+	}
+	return strings.TrimSpace(c.FabricDef.ControlPlane.API.Address)
+}
+
+func (c *Conductor) distributedIdentityProvider() (identity.CertificateProvider, error) {
+	if c.IdentityProvider != nil {
+		return c.IdentityProvider, nil
+	}
+
+	provider, err := identity.ProviderFromFabric(c.FabricDef, c.BaseDir)
+	if err != nil {
+		return nil, fmt.Errorf("create identity provider: %w", err)
+	}
+	c.IdentityProvider = provider
+	return provider, nil
+}
+
+func (c *Conductor) nodeAttestor() identity.Attestor {
+	if c.NodeAttestor != nil {
+		return c.NodeAttestor
+	}
+	return identity.NewLocalDevJoinTokenAuthority(c.BaseDir, identity.TrustDomainFromFabric(c.FabricDef))
+}
+
+func (c *Conductor) conductorIdentityRequest(listenAddr, advertiseAddr string) identity.IssueRequest {
+	request := identity.IssueRequest{
+		Subject: identity.Subject{
+			TrustDomain: identity.TrustDomainFromFabric(c.FabricDef),
+			Fabric:      c.FabricDef.Fabric.Name,
+			Kind:        identity.SubjectKindConductor,
+			Name:        "conductor",
+		},
+		Principal: "conductor",
+	}
+
+	for _, endpoint := range []string{advertiseAddr, listenAddr} {
+		host, _, err := net.SplitHostPort(strings.TrimSpace(endpoint))
+		if err != nil {
+			continue
+		}
+		switch host {
+		case "", "0.0.0.0", "::":
+			continue
+		}
+		if ip := net.ParseIP(host); ip != nil {
+			if !containsIP(request.IPAddresses, ip) {
+				request.IPAddresses = append(request.IPAddresses, ip)
+			}
+			continue
+		}
+		if !containsString(request.DNSNames, host) {
+			request.DNSNames = append(request.DNSNames, host)
+		}
+	}
+	return request
 }
 
 // Start sets up the system and prepares it for requests.
 func (c *Conductor) Start(ctx context.Context) error {
-	// Local mode only — distributed mode registers with the actual gRPC address.
-	if !c.Distributed {
+	// Local mode only: external-node mode registers with the actual gRPC address.
+	if !c.ExternalAgents {
 		c.Discovery.Register(ctx, "conductor", runtime.Endpoint{Address: "local", Local: true})
 	}
 
@@ -269,14 +424,10 @@ func (c *Conductor) Start(ctx context.Context) error {
 				}
 				return metered.Generate(callCtx, input)
 			}
-			// Capped output tokens to prevent runaway decomposition responses.
 			c.conductorDecomposeGenerate = func(callCtx context.Context, input []*schema.Message) (*schema.Message, error) {
-				m, err := llm.NewChatModel(callCtx, conductorModel, &llm.ProviderConfig{MaxTokens: decomposeMaxOutputTokens}, c.FabricDef.Providers)
+				m, err := c.ModelFactory(callCtx, conductorModel)
 				if err != nil {
-					m, err = c.ModelFactory(callCtx, conductorModel)
-					if err != nil {
-						return nil, err
-					}
+					return nil, err
 				}
 				metered := &llm.MeteredModel{
 					Model:     m,
@@ -292,51 +443,301 @@ func (c *Conductor) Start(ctx context.Context) error {
 		}
 	}
 
-	if c.Distributed {
-		c.startClusterMonitor(ctx)
+	if err := c.startControlPlane(ctx); err != nil {
+		return err
 	}
 
 	return Setup(ctx, c)
 }
 
-func (c *Conductor) startClusterMonitor(ctx context.Context) {
-	lifecycle, ok := c.Lifecycle.(*agentgrpc.ProcessLifecycle)
-	if !ok {
-		return
+func (c *Conductor) startControlPlane(ctx context.Context) error {
+	if c.ControlPlane == nil {
+		return nil
 	}
 
-	knownAgents := make(map[string]bool, len(c.FabricDef.Agents)+1)
-	knownAgents["conductor"] = true
-	for _, def := range c.FabricDef.Agents {
-		knownAgents[def.Name] = true
+	node := c.controlPlaneNode()
+	if err := c.ControlPlane.RegisterNode(ctx, node); err != nil {
+		return fmt.Errorf("register control plane node: %w", err)
 	}
 
-	mon := &cluster.Monitor{
-		Self: cluster.MemberInfo{
-			Name:    "conductor",
-			Role:    "conductor",
-			Address: c.ConductorListenAddr,
-			PID:     os.Getpid(),
+	lease, acquired, err := c.ControlPlane.AcquireLeader(ctx, c.ConductorID, node.Address, controlPlaneLeaderTTL)
+	if err != nil {
+		return fmt.Errorf("acquire leader lease: %w", err)
+	}
+	if !acquired {
+		return fmt.Errorf("control plane leader already held by %q", lease.HolderID)
+	}
+
+	c.setLeaderLease(lease)
+	if err := c.reconcileRecoveredRequests(ctx); err != nil {
+		return err
+	}
+	go c.runNodeHeartbeatLoop(c.backgroundCtx)
+	go c.runLeaderHeartbeatLoop(c.backgroundCtx, node.Address)
+	return nil
+}
+
+func (c *Conductor) controlPlaneNode() controlplane.Node {
+	address := "local"
+	mode := "local"
+	if c.ExternalAgents {
+		address = c.conductorEndpointAddress()
+		mode = "external-node"
+	}
+
+	maxInstances := len(c.FabricDef.Agents) - 1
+	maxTasks := maxInstances
+	if maxTasks < 1 {
+		maxTasks = 1
+	}
+
+	return controlplane.Node{
+		ID:             c.ConductorID,
+		Address:        address,
+		State:          controlplane.NodeStateReady,
+		BundleDigest:   c.BundleDigest,
+		ProfileDigests: cloneStringMap(c.ProfileDigests),
+		Labels: map[string]string{
+			"role": "conductor",
+			"mode": mode,
 		},
-		StatePath:    cluster.StatePath(c.BaseDir),
-		KnownMembers: knownAgents,
-		OnMemberDead: func(dead cluster.MemberInfo) {
-			if dead.Role != "agent" {
-				return
+		Capacity: controlplane.NodeCapacity{
+			MaxInstances: maxInstances,
+			MaxTasks:     maxTasks,
+		},
+	}
+}
+
+func (c *Conductor) conductorEndpointAddress() string {
+	if strings.TrimSpace(c.ConductorAdvertiseAddr) != "" {
+		return strings.TrimSpace(c.ConductorAdvertiseAddr)
+	}
+	if strings.TrimSpace(c.ConductorListenAddr) != "" {
+		return strings.TrimSpace(c.ConductorListenAddr)
+	}
+	return ":50050"
+}
+
+func actualConductorAddress(boundAddr, configuredAddr, advertiseAddr string) string {
+	if explicit := normalizeAdvertiseAddress(boundAddr, advertiseAddr); explicit != "" {
+		return explicit
+	}
+
+	host, port, err := net.SplitHostPort(boundAddr)
+	if err != nil {
+		return boundAddr
+	}
+	switch host {
+	case "", "0.0.0.0", "::":
+		configuredHost, _, configuredErr := net.SplitHostPort(configuredAddr)
+		if configuredErr == nil && configuredHost != "" && configuredHost != "0.0.0.0" && configuredHost != "::" {
+			host = configuredHost
+		} else if hintedHost := conductorAdvertiseHostHint(); hintedHost != "" {
+			host = hintedHost
+		} else {
+			host = "127.0.0.1"
+		}
+	}
+	return net.JoinHostPort(host, port)
+}
+
+func (c *Conductor) resolveConfiguredConductorAdvertiseAddr(listenAddr string) string {
+	if explicit := strings.TrimSpace(c.ConductorAdvertiseAddr); explicit != "" {
+		return explicit
+	}
+
+	hint := conductorAdvertiseHostHint()
+	if hint == "" {
+		return ""
+	}
+
+	_, port, err := net.SplitHostPort(strings.TrimSpace(listenAddr))
+	if err != nil || port == "" || port == "0" {
+		return hint
+	}
+	return net.JoinHostPort(hint, port)
+}
+
+func conductorAdvertiseHostHint() string {
+	for _, key := range []string{"AGENTFAB_ADVERTISE_HOST", "POD_IP"} {
+		if value := strings.TrimSpace(os.Getenv(key)); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func normalizeAdvertiseAddress(boundAddr, advertiseAddr string) string {
+	advertiseAddr = strings.TrimSpace(advertiseAddr)
+	if advertiseAddr == "" {
+		return ""
+	}
+
+	if _, _, err := net.SplitHostPort(advertiseAddr); err == nil {
+		return advertiseAddr
+	}
+
+	host := advertiseAddr
+	_, port, err := net.SplitHostPort(boundAddr)
+	if err != nil || port == "" || port == "0" {
+		return host
+	}
+	return net.JoinHostPort(host, port)
+}
+
+func containsIP(ips []net.IP, candidate net.IP) bool {
+	for _, existing := range ips {
+		if existing.Equal(candidate) {
+			return true
+		}
+	}
+	return false
+}
+
+func containsString(values []string, candidate string) bool {
+	for _, existing := range values {
+		if existing == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func cloneStringMap(values map[string]string) map[string]string {
+	if len(values) == 0 {
+		return nil
+	}
+	cloned := make(map[string]string, len(values))
+	for key, value := range values {
+		cloned[key] = value
+	}
+	return cloned
+}
+
+func (c *Conductor) runNodeHeartbeatLoop(ctx context.Context) {
+	ticker := time.NewTicker(controlPlaneHeartbeatInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-ticker.C:
+			if err := c.ControlPlane.HeartbeatNode(ctx, c.ConductorID, now); err != nil {
+				slog.Warn("control plane node heartbeat failed", "node_id", c.ConductorID, "error", err)
 			}
-			slog.Warn("conductor: dead agent detected, respawning", "name", dead.Name)
-			// Find the agent definition.
-			for _, def := range c.FabricDef.Agents {
-				if def.Name == dead.Name {
-					if err := lifecycle.Respawn(ctx, def); err != nil {
-						slog.Error("conductor: respawn failed", "agent", dead.Name, "error", err)
-					}
-					return
+		}
+	}
+}
+
+func (c *Conductor) runLeaderHeartbeatLoop(ctx context.Context, address string) {
+	ticker := time.NewTicker(controlPlaneHeartbeatInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			lease, ok := c.getLeaderLease()
+			if !ok {
+				reacquiredLease, acquired, err := c.ControlPlane.AcquireLeader(ctx, c.ConductorID, address, controlPlaneLeaderTTL)
+				if err != nil {
+					slog.Warn("control plane leader reacquire failed", "candidate_id", c.ConductorID, "error", err)
+					continue
+				}
+				if !acquired {
+					slog.Warn("control plane leadership unavailable", "holder_id", reacquiredLease.HolderID)
+					continue
+				}
+				c.setLeaderLease(reacquiredLease)
+				continue
+			}
+
+			renewedLease, err := c.ControlPlane.RenewLeader(ctx, lease, controlPlaneLeaderTTL)
+			if err != nil {
+				slog.Warn("control plane leader renew failed", "holder_id", c.ConductorID, "epoch", lease.Epoch, "error", err)
+				c.clearLeaderLease()
+				continue
+			}
+			c.setLeaderLease(renewedLease)
+		}
+	}
+}
+
+func (c *Conductor) reconcileRecoveredRequests(ctx context.Context) error {
+	requests, err := c.ControlPlane.ListRequests(ctx)
+	if err != nil {
+		return fmt.Errorf("list control plane requests: %w", err)
+	}
+
+	for _, request := range requests {
+		if request.State != controlplane.RequestStateRunning {
+			continue
+		}
+
+		tasks, err := c.ControlPlane.ListTasks(ctx, request.ID)
+		if err != nil {
+			return fmt.Errorf("list tasks for recovered request %q: %w", request.ID, err)
+		}
+
+		for _, task := range tasks {
+			if lease, ok, leaseErr := c.ControlPlane.GetTaskLease(ctx, request.ID, task.TaskID); leaseErr != nil {
+				return fmt.Errorf("get task lease for recovered request %q task %q: %w", request.ID, task.TaskID, leaseErr)
+			} else if ok {
+				if releaseErr := c.ControlPlane.ReleaseTaskLease(ctx, lease); releaseErr != nil {
+					return fmt.Errorf("release task lease for recovered request %q task %q: %w", request.ID, task.TaskID, releaseErr)
 				}
 			}
-		},
+
+			if !isRecoverableTaskStatus(task.Status) {
+				continue
+			}
+			task.Status = "interrupted"
+			if err := c.ControlPlane.UpsertTask(ctx, task); err != nil {
+				return fmt.Errorf("interrupt recovered task %q for request %q: %w", task.TaskID, request.ID, err)
+			}
+		}
+
+		request.State = controlplane.RequestStateInterrupted
+		request.LeaderID = c.ConductorID
+		if err := c.ControlPlane.UpsertRequest(ctx, request); err != nil {
+			return fmt.Errorf("interrupt recovered request %q: %w", request.ID, err)
+		}
 	}
-	go mon.Run(ctx)
+
+	return nil
+}
+
+func isRecoverableTaskStatus(status string) bool {
+	switch status {
+	case string(taskgraph.StatusPending), string(taskgraph.StatusRunning):
+		return true
+	default:
+		return false
+	}
+}
+
+func (c *Conductor) setLeaderLease(lease controlplane.LeaderLease) {
+	c.controlPlaneMu.Lock()
+	defer c.controlPlaneMu.Unlock()
+	leaseCopy := lease
+	c.leaderLease = &leaseCopy
+}
+
+func (c *Conductor) getLeaderLease() (controlplane.LeaderLease, bool) {
+	c.controlPlaneMu.RLock()
+	defer c.controlPlaneMu.RUnlock()
+	if c.leaderLease == nil {
+		return controlplane.LeaderLease{}, false
+	}
+	return *c.leaderLease, true
+}
+
+func (c *Conductor) clearLeaderLease() {
+	c.controlPlaneMu.Lock()
+	defer c.controlPlaneMu.Unlock()
+	c.leaderLease = nil
 }
 
 // HandleRequest processes a user request end-to-end.
@@ -417,11 +818,11 @@ func (c *Conductor) HandleRequest(ctx context.Context, userRequest string) (stri
 		}
 	}
 
+	conductorStorage := c.StorageFactory("conductor")
 	conductorKnowledge := ""
 	for _, a := range c.FabricDef.Agents {
 		if a.Name == "conductor" && a.SpecialKnowledgeFile != "" {
-			skPath := filepath.Join(c.BaseDir, "agents", "conductor", "special_knowledge.md")
-			if data, err := os.ReadFile(skPath); err == nil {
+			if data, err := conductorStorage.Read(ctx, runtime.TierAgent, "special_knowledge.md"); err == nil {
 				conductorKnowledge = string(data)
 			}
 			break
@@ -431,7 +832,6 @@ func (c *Conductor) HandleRequest(ctx context.Context, userRequest string) (stri
 	// Wait for prior background knowledge generation to avoid loading stale graphs.
 	c.knowledgeWg.Wait()
 
-	conductorStorage := c.StorageFactory("conductor")
 	existingGraph, _ := knowledge.Load(ctx, conductorStorage)
 	if existingGraph == nil {
 		existingGraph = knowledge.NewGraph()
@@ -563,6 +963,7 @@ func (c *Conductor) HandleRequest(ctx context.Context, userRequest string) (stri
 
 	scheduler := &Scheduler{
 		Comm:              c.Comm,
+		ControlPlane:      c.ControlPlane,
 		Logger:            c.Logger,
 		Storage:           conductorStorage,
 		Meter:             c.Meter,
@@ -571,6 +972,7 @@ func (c *Conductor) HandleRequest(ctx context.Context, userRequest string) (stri
 		Events:            c.Events,
 		Agents:            c.FabricDef.Agents,
 		UserRequest:       userRequest,
+		LeaseOwnerID:      c.ConductorID,
 		KnowledgeGraph:    existingGraph,
 		AgentGraphs:       agentGraphs,
 		KnowledgeGenerate: c.conductorGenerate,
@@ -578,6 +980,14 @@ func (c *Conductor) HandleRequest(ctx context.Context, userRequest string) (stri
 		graphReplace:      make(chan *taskgraph.TaskGraph, 1),
 		reqCancel:         reqCancel,
 	}
+
+	c.upsertRequestState(reqCtx, controlplane.RequestRecord{
+		ID:           requestID,
+		State:        controlplane.RequestStateRunning,
+		UserRequest:  userRequest,
+		GraphVersion: 1,
+		LeaderID:     c.ConductorID,
+	})
 
 	c.mu.Lock()
 	c.activeScheduler = scheduler
@@ -599,10 +1009,24 @@ func (c *Conductor) HandleRequest(ctx context.Context, userRequest string) (stri
 		}
 	}
 	if allCancelled && len(graph.Tasks) > 0 {
+		c.upsertRequestState(context.WithoutCancel(ctx), controlplane.RequestRecord{
+			ID:           requestID,
+			State:        controlplane.RequestStateCancelled,
+			UserRequest:  userRequest,
+			GraphVersion: 1,
+			LeaderID:     c.ConductorID,
+		})
 		return "", ErrRequestCancelled
 	}
 
 	if execErr != nil {
+		c.upsertRequestState(context.WithoutCancel(ctx), controlplane.RequestRecord{
+			ID:           requestID,
+			State:        controlplane.RequestStateFailed,
+			UserRequest:  userRequest,
+			GraphVersion: 1,
+			LeaderID:     c.ConductorID,
+		})
 		return "", fmt.Errorf("execute: %w", execErr)
 	}
 
@@ -664,6 +1088,18 @@ func (c *Conductor) HandleRequest(ctx context.Context, userRequest string) (stri
 	}
 	c.Events.Emit(completeEvt)
 
+	requestState := controlplane.RequestStateCompleted
+	if graph.HasFailures() {
+		requestState = controlplane.RequestStateFailed
+	}
+	c.upsertRequestState(context.WithoutCancel(ctx), controlplane.RequestRecord{
+		ID:           requestID,
+		State:        requestState,
+		UserRequest:  userRequest,
+		GraphVersion: 1,
+		LeaderID:     c.ConductorID,
+	})
+
 	finalResult := c.collectResults(graph)
 	scheduler.persistHitCounters(context.WithoutCancel(ctx))
 	go c.StartIdleCuration(context.WithoutCancel(ctx))
@@ -675,19 +1111,20 @@ func toTaskSummaries(graph *taskgraph.TaskGraph) []event.TaskSummary {
 	summaries := make([]event.TaskSummary, len(graph.Tasks))
 	for i, t := range graph.Tasks {
 		summaries[i] = event.TaskSummary{
-			ID:          t.ID,
-			Agent:       t.Agent,
-			Description: t.Description,
-			DependsOn:   t.DependsOn,
-			Status:      string(t.Status),
-			LoopID:      t.LoopID,
+			ID:            t.ID,
+			Agent:         t.TargetProfile(),
+			ExecutionNode: t.ExecutionNode,
+			Description:   t.Description,
+			DependsOn:     t.DependsOn,
+			Status:        string(t.Status),
+			LoopID:        t.LoopID,
 		}
 	}
 	return summaries
 }
 
 func (c *Conductor) writeArtifacts(requestID string, graph *taskgraph.TaskGraph) error {
-	artifactDir := filepath.Join(c.BaseDir, "shared", "artifacts", "_requests", requestID)
+	artifactDir := filepath.Join(c.StorageLayout.SharedRoot, "artifacts", "_requests", requestID)
 	if err := os.MkdirAll(artifactDir, 0755); err != nil {
 		return fmt.Errorf("create artifact dir: %w", err)
 	}
@@ -726,10 +1163,45 @@ func (c *Conductor) collectResults(graph *taskgraph.TaskGraph) string {
 			if result != "" {
 				result += "\n\n---\n\n"
 			}
-			result += fmt.Sprintf("**%s** (%s):\n%s", task.ID, task.Agent, task.Result)
+			result += fmt.Sprintf("**%s** (%s):\n%s", task.ID, task.TargetProfile(), task.Result)
 		}
 	}
 	return result
+}
+
+func (c *Conductor) upsertRequestState(ctx context.Context, request controlplane.RequestRecord) {
+	if c.ControlPlane == nil {
+		return
+	}
+	if err := c.ControlPlane.UpsertRequest(ctx, request); err != nil {
+		slog.Warn("control plane request upsert failed", "request_id", request.ID, "error", err)
+	}
+}
+
+func (c *Conductor) stopControlPlane(ctx context.Context) {
+	if c.ControlPlane == nil {
+		return
+	}
+
+	lease, ok := c.getLeaderLease()
+	if ok {
+		if err := c.ControlPlane.ReleaseLeader(ctx, lease); err != nil {
+			slog.Warn("control plane leader release failed", "holder_id", c.ConductorID, "epoch", lease.Epoch, "error", err)
+		}
+		c.clearLeaderLease()
+	}
+
+	node := c.controlPlaneNode()
+	node.State = controlplane.NodeStateUnavailable
+	node.LastHeartbeatAt = time.Now()
+	if err := c.ControlPlane.RegisterNode(ctx, node); err != nil {
+		slog.Warn("control plane node shutdown update failed", "node_id", c.ConductorID, "error", err)
+	}
+	if closer, ok := c.ControlPlane.(interface{ Close() error }); ok {
+		if err := closer.Close(); err != nil {
+			slog.Warn("control plane close failed", "error", err)
+		}
+	}
 }
 
 func newRequestID() string {
@@ -965,18 +1437,17 @@ func (c *Conductor) RestructureGraph(ctx context.Context, userRequest, amendment
 		modifiedRequest += fmt.Sprintf("\nAlready completed work (do not redo):\n%s\nDecompose only the remaining work needed to satisfy the amended request.\n", completedContext)
 	}
 
+	conductorStorage := c.StorageFactory("conductor")
 	conductorKnowledge := ""
 	for _, a := range c.FabricDef.Agents {
 		if a.Name == "conductor" && a.SpecialKnowledgeFile != "" {
-			skPath := filepath.Join(c.BaseDir, "agents", "conductor", "special_knowledge.md")
-			if data, err := os.ReadFile(skPath); err == nil {
+			if data, err := conductorStorage.Read(ctx, runtime.TierAgent, "special_knowledge.md"); err == nil {
 				conductorKnowledge = string(data)
 			}
 			break
 		}
 	}
 
-	conductorStorage := c.StorageFactory("conductor")
 	existingGraph, _ := knowledge.Load(ctx, conductorStorage)
 	if existingGraph == nil {
 		existingGraph = knowledge.NewGraph()
@@ -1310,10 +1781,14 @@ func (c *Conductor) Shutdown(ctx context.Context) error {
 		if c.cancelBackground != nil {
 			c.cancelBackground()
 		}
+		c.stopControlPlane(ctx)
 		c.knowledgeWg.Wait()
 		c.shutdownErr = c.Lifecycle.TeardownAll(ctx)
 		if c.conductorGRPCServer != nil {
 			c.conductorGRPCServer.Stop()
+		}
+		if c.distributedIdentity != nil {
+			c.distributedIdentity.Close()
 		}
 	})
 	return c.shutdownErr
@@ -1403,4 +1878,53 @@ type AgentStatus struct {
 	InputTokens  int64
 	OutputTokens int64
 	TotalCalls   int64
+}
+
+type RuntimeStatus struct {
+	Mode                string
+	ControlPlaneAddress string
+	NodeCount           int
+	ReadyNodeCount      int
+	InstanceCount       int
+	ReadyInstanceCount  int
+}
+
+func (c *Conductor) RuntimeStatus(ctx context.Context) RuntimeStatus {
+	status := RuntimeStatus{
+		Mode:                conductorRuntimeMode(c.ExternalAgents),
+		ControlPlaneAddress: strings.TrimSpace(c.controlPlaneAPIAddress()),
+	}
+
+	if c.ControlPlane == nil {
+		return status
+	}
+
+	nodes, err := c.ControlPlane.ListNodes(ctx)
+	if err == nil {
+		status.NodeCount = len(nodes)
+		for _, node := range nodes {
+			if node.State == controlplane.NodeStateReady {
+				status.ReadyNodeCount++
+			}
+		}
+	}
+
+	instances, err := c.ControlPlane.ListInstances(ctx, controlplane.InstanceFilter{})
+	if err == nil {
+		status.InstanceCount = len(instances)
+		for _, instance := range instances {
+			if instance.State == controlplane.InstanceStateReady || instance.State == controlplane.InstanceStateBusy {
+				status.ReadyInstanceCount++
+			}
+		}
+	}
+
+	return status
+}
+
+func conductorRuntimeMode(externalAgents bool) string {
+	if externalAgents {
+		return "External-Node Distributed"
+	}
+	return "Local"
 }

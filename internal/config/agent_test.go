@@ -32,6 +32,12 @@ func TestValidateAgentDefinition(t *testing.T) {
 		{"empty model", func(d *runtime.AgentDefinition) { d.Model = "" }},
 		{"model no provider", func(d *runtime.AgentDefinition) { d.Model = "claude-opus-4" }},
 		{"invalid escalation", func(d *runtime.AgentDefinition) { d.EscalationTarget = "Bad_Name" }},
+		{"empty required node label key", func(d *runtime.AgentDefinition) {
+			d.RequiredNodeLabels = map[string]string{"": "gpu"}
+		}},
+		{"empty required node label value", func(d *runtime.AgentDefinition) {
+			d.RequiredNodeLabels = map[string]string{"accelerator": ""}
+		}},
 		{"empty tool name", func(d *runtime.AgentDefinition) {
 			d.Tools = []runtime.ToolConfig{{Name: ""}}
 		}},

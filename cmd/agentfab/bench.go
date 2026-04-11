@@ -30,9 +30,10 @@ func benchCmd() *cobra.Command {
 		competitorModel string
 	)
 	cmd := &cobra.Command{
-		Use:   "bench",
-		Short: "Run benchmark scenarios and produce comparison tables",
-		Long:  "Run standardized tasks under different model configurations and produce cost, quality, and duration comparisons.",
+		Use:    "bench",
+		Short:  "Run benchmark scenarios and produce comparison tables",
+		Long:   "Run standardized tasks under different model configurations and produce cost, quality, and duration comparisons.",
+		Hidden: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			td, err := config.LoadFabricDef(configFile)
 			if err != nil {

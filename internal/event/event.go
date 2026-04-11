@@ -40,9 +40,11 @@ const (
 )
 
 type KnowledgeNodeInfo struct {
-	ID    string
-	Agent string
-	Title string
+	ID      string
+	Agent   string
+	Title   string
+	Summary string
+	Tags    []string
 }
 
 type KnowledgeRelInfo struct {
@@ -58,12 +60,13 @@ type KnowledgeEdgeInfo struct {
 }
 
 type TaskSummary struct {
-	ID          string
-	Agent       string
-	Description string
-	DependsOn   []string
-	Status      string // "pending", "running", "completed", "failed", "cancelled"
-	LoopID      string // non-empty when the task participates in an orchestration loop
+	ID            string
+	Agent         string
+	ExecutionNode string
+	Description   string
+	DependsOn     []string
+	Status        string // "pending", "running", "completed", "failed", "cancelled"
+	LoopID        string // non-empty when the task participates in an orchestration loop
 }
 
 // Event carries a lifecycle signal from conductor/scheduler to the renderer.
@@ -78,6 +81,7 @@ type Event struct {
 
 	TaskID          string
 	TaskAgent       string
+	ExecutionNode   string
 	TaskDescription string
 	Duration        time.Duration
 	ErrMsg          string
@@ -104,16 +108,16 @@ type Event struct {
 	KnowledgeNodes int
 	KnowledgeEdges int
 
-	KnowledgeLookupAgent string
-	KnowledgeLookupTask  string
-	KnowledgeLookupOwnNodes    []KnowledgeNodeInfo
-	KnowledgeLookupRelNodes    []KnowledgeRelInfo
-	KnowledgeLookupEdges []KnowledgeEdgeInfo
+	KnowledgeLookupAgent    string
+	KnowledgeLookupTask     string
+	KnowledgeLookupOwnNodes []KnowledgeNodeInfo
+	KnowledgeLookupRelNodes []KnowledgeRelInfo
+	KnowledgeLookupEdges    []KnowledgeEdgeInfo
 
-	CurationAgent    string
-	CurationNodesIn  int
-	CurationNodesOut int
-	ColdStorageMoved int
+	CurationAgent     string
+	CurationNodesIn   int
+	CurationNodesOut  int
+	ColdStorageMoved  int
 	ColdStoragePurged int
 
 	TotalDuration    time.Duration

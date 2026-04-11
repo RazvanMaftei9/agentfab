@@ -2,10 +2,12 @@ package conductor
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/razvanmaftei/agentfab/internal/controlplane"
 	"github.com/razvanmaftei/agentfab/internal/event"
 	"github.com/razvanmaftei/agentfab/internal/knowledge"
 	"github.com/razvanmaftei/agentfab/internal/local"
@@ -465,6 +467,256 @@ func TestLoopDispatchInitialMessage(t *testing.T) {
 	events.Close()
 }
 
+func TestLoopDispatchPinsAssignedInstances(t *testing.T) {
+	hub := local.NewHub()
+	conductorComm := hub.Register("conductor")
+	devComm := hub.Register("developer")
+	_ = hub.Register("architect")
+	store := controlplane.NewMemoryStore("test-fabric")
+
+	ctx := context.Background()
+	if err := store.RegisterInstance(ctx, controlplane.AgentInstance{
+		ID:              "node-a/developer/1",
+		Profile:         "developer",
+		NodeID:          "node-a",
+		Endpoint:        runtime.Endpoint{Address: "10.0.0.1:6001"},
+		State:           controlplane.InstanceStateReady,
+		LastHeartbeatAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("RegisterInstance developer: %v", err)
+	}
+	if err := store.RegisterInstance(ctx, controlplane.AgentInstance{
+		ID:              "node-b/architect/1",
+		Profile:         "architect",
+		NodeID:          "node-b",
+		Endpoint:        runtime.Endpoint{Address: "10.0.0.2:6001"},
+		State:           controlplane.InstanceStateReady,
+		LastHeartbeatAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("RegisterInstance architect: %v", err)
+	}
+
+	loopDef := schedulerTestLoop()
+	graph := &taskgraph.TaskGraph{
+		RequestID: "req-loop-placement",
+		Tasks: []*taskgraph.TaskNode{
+			{ID: "t1", Agent: "developer", Description: "Implement login", LoopID: "review-1", Status: taskgraph.StatusRunning},
+		},
+		Loops: []loop.LoopDefinition{loopDef},
+	}
+
+	s := &Scheduler{
+		Comm:         conductorComm,
+		ControlPlane: store,
+		RequestID:    "req-loop-placement",
+		LeaseOwnerID: "conductor-test",
+	}
+
+	runCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- s.dispatchLoopTask(runCtx, graph.Tasks[0], graph)
+	}()
+
+	select {
+	case msg := <-devComm.Receive(runCtx):
+		if msg.Metadata["assigned_instance"] != "node-a/developer/1" {
+			t.Fatalf("assigned instance = %q, want node-a/developer/1", msg.Metadata["assigned_instance"])
+		}
+		if msg.Metadata["execution_node"] != "node-a" {
+			t.Fatalf("execution node = %q, want node-a", msg.Metadata["execution_node"])
+		}
+		lc, ok := loop.DecodeContext(msg)
+		if !ok {
+			t.Fatal("missing loop_context in initial message")
+		}
+		if lc.AssignedInstances["developer"] != "node-a/developer/1" {
+			t.Fatalf("developer assignment = %q, want node-a/developer/1", lc.AssignedInstances["developer"])
+		}
+		if lc.AssignedInstances["architect"] != "node-b/architect/1" {
+			t.Fatalf("architect assignment = %q, want node-b/architect/1", lc.AssignedInstances["architect"])
+		}
+		if lc.ExecutionNodes["architect"] != "node-b" {
+			t.Fatalf("architect execution node = %q, want node-b", lc.ExecutionNodes["architect"])
+		}
+
+		devComm.Send(runCtx, &message.Message{
+			ID:        "r1",
+			RequestID: "req-loop-placement",
+			From:      "developer",
+			To:        "conductor",
+			Type:      message.TypeTaskResult,
+			Parts:     []message.Part{message.TextPart{Text: "loop done"}},
+			Metadata:  map[string]string{"task_id": "t1"},
+			Timestamp: time.Now(),
+		})
+	case <-runCtx.Done():
+		t.Fatal("timeout waiting for initial loop dispatch")
+	}
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("dispatchLoopTask: %v", err)
+		}
+	case <-runCtx.Done():
+		t.Fatal("timeout waiting for loop completion")
+	}
+}
+
+func TestSchedulerLoopUpdatesActiveExecutionFromStatusUpdate(t *testing.T) {
+	hub := local.NewHub()
+	conductorComm := hub.Register("conductor")
+	devComm := hub.Register("developer")
+	archComm := hub.Register("architect")
+	store := controlplane.NewMemoryStore("test-fabric")
+
+	ctx := context.Background()
+	now := time.Now().UTC()
+	if err := store.RegisterNode(ctx, controlplane.Node{
+		ID:              "node-a",
+		State:           controlplane.NodeStateReady,
+		LastHeartbeatAt: now,
+	}); err != nil {
+		t.Fatalf("RegisterNode node-a: %v", err)
+	}
+	if err := store.RegisterNode(ctx, controlplane.Node{
+		ID:              "node-b",
+		State:           controlplane.NodeStateReady,
+		LastHeartbeatAt: now,
+	}); err != nil {
+		t.Fatalf("RegisterNode node-b: %v", err)
+	}
+	if err := store.RegisterInstance(ctx, controlplane.AgentInstance{
+		ID:              "node-a/developer/1",
+		Profile:         "developer",
+		NodeID:          "node-a",
+		Endpoint:        runtime.Endpoint{Address: "10.0.0.1:6001"},
+		State:           controlplane.InstanceStateReady,
+		LastHeartbeatAt: now,
+	}); err != nil {
+		t.Fatalf("RegisterInstance developer: %v", err)
+	}
+	if err := store.RegisterInstance(ctx, controlplane.AgentInstance{
+		ID:              "node-b/architect/1",
+		Profile:         "architect",
+		NodeID:          "node-b",
+		Endpoint:        runtime.Endpoint{Address: "10.0.0.2:6001"},
+		State:           controlplane.InstanceStateReady,
+		LastHeartbeatAt: now,
+	}); err != nil {
+		t.Fatalf("RegisterInstance architect: %v", err)
+	}
+
+	loopDef := schedulerTestLoop()
+	graph := &taskgraph.TaskGraph{
+		RequestID: "req-loop-transition",
+		Tasks: []*taskgraph.TaskNode{
+			{ID: "t1", Agent: "developer", Description: "Implement login", LoopID: "review-1", Status: taskgraph.StatusPending},
+		},
+		Loops: []loop.LoopDefinition{loopDef},
+	}
+
+	s := &Scheduler{
+		Comm:         conductorComm,
+		ControlPlane: store,
+		RequestID:    "req-loop-transition",
+		LeaseOwnerID: "conductor-test",
+	}
+
+	runCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- s.Execute(runCtx, graph)
+	}()
+
+	select {
+	case <-devComm.Receive(runCtx):
+	case <-runCtx.Done():
+		t.Fatal("timeout waiting for initial loop dispatch")
+	}
+
+	conductorComm.Send(runCtx, &message.Message{
+		ID:        "status-1",
+		RequestID: "req-loop-transition",
+		From:      "architect",
+		To:        "conductor",
+		Type:      message.TypeStatusUpdate,
+		Parts:     []message.Part{message.TextPart{Text: "Loop state REVIEWING active on architect"}},
+		Metadata: map[string]string{
+			"task_id":           "t1",
+			"loop_id":           "review-1",
+			"loop_state":        "REVIEWING",
+			"assigned_instance": "node-b/architect/1",
+			"execution_node":    "node-b",
+		},
+		Timestamp: time.Now(),
+	})
+
+	select {
+	case <-archComm.Receive(runCtx):
+		t.Fatal("unexpected direct message to architect in scheduler-only transition test")
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	staleAt := time.Now().UTC().Add(-controlplane.InstanceHeartbeatTTL - time.Second)
+	if err := store.RegisterInstance(ctx, controlplane.AgentInstance{
+		ID:              "node-b/architect/1",
+		Profile:         "architect",
+		NodeID:          "node-b",
+		Endpoint:        runtime.Endpoint{Address: "10.0.0.2:6001"},
+		State:           controlplane.InstanceStateReady,
+		LastHeartbeatAt: staleAt,
+	}); err != nil {
+		t.Fatalf("RegisterInstance stale architect: %v", err)
+	}
+
+	var redispatch *message.Message
+	select {
+	case redispatch = <-devComm.Receive(runCtx):
+	case <-runCtx.Done():
+		t.Fatal("timeout waiting for loop redispatch")
+	}
+	if redispatch.Metadata["assigned_instance"] != "node-a/developer/1" {
+		t.Fatalf("redispatch assigned instance = %q, want node-a/developer/1", redispatch.Metadata["assigned_instance"])
+	}
+
+	devComm.Send(runCtx, &message.Message{
+		ID:        "r2",
+		RequestID: "req-loop-transition",
+		From:      "developer",
+		To:        "conductor",
+		Type:      message.TypeTaskResult,
+		Parts:     []message.Part{message.TextPart{Text: "loop recovered"}},
+		Metadata: map[string]string{
+			"task_id":        "t1",
+			"dispatch_nonce": redispatch.Metadata["dispatch_nonce"],
+		},
+		Timestamp: time.Now(),
+	})
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("Execute: %v", err)
+		}
+	case <-runCtx.Done():
+		t.Fatal("timeout waiting for loop execution")
+	}
+
+	task := graph.Tasks[0]
+	if task.Status != taskgraph.StatusCompleted {
+		t.Fatalf("task status = %q, want completed", task.Status)
+	}
+	if task.AssignedInstance != "node-a/developer/1" {
+		t.Fatalf("task assigned instance = %q, want node-a/developer/1", task.AssignedInstance)
+	}
+}
+
 // TestLoopDispatchCompletesOnResult verifies the conductor correctly handles
 // the terminal TypeTaskResult from any loop participant.
 func TestLoopDispatchCompletesOnResult(t *testing.T) {
@@ -597,6 +849,69 @@ func TestLoopDispatchEscalation(t *testing.T) {
 
 	if graph.Tasks[0].Status != taskgraph.StatusEscalated {
 		t.Errorf("status: got %q, want escalated", graph.Tasks[0].Status)
+	}
+
+	events.Close()
+}
+
+func TestLoopDispatchFailureMarksTaskFailed(t *testing.T) {
+	hub := local.NewHub()
+	conductorComm := hub.Register("conductor")
+	devComm := hub.Register("developer")
+	_ = hub.Register("architect")
+
+	loopDef := schedulerTestLoop()
+	graph := &taskgraph.TaskGraph{
+		RequestID: "req-loop-fail",
+		Tasks: []*taskgraph.TaskNode{
+			{ID: "t1", Agent: "developer", Description: "Implement", LoopID: "review-1", Status: taskgraph.StatusRunning},
+		},
+		Loops: []loop.LoopDefinition{loopDef},
+	}
+
+	events := event.NewBus()
+	s := &Scheduler{
+		Comm:      conductorComm,
+		RequestID: "req-loop-fail",
+		Events:    events,
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- s.dispatchLoopTask(ctx, graph.Tasks[0], graph)
+	}()
+
+	select {
+	case <-devComm.Receive(ctx):
+	case <-ctx.Done():
+		t.Fatal("timeout waiting for initial dispatch")
+	}
+
+	devComm.Send(ctx, &message.Message{
+		ID: "r-fail", RequestID: "req-loop-fail", From: "developer", To: "conductor",
+		Type:      message.TypeTaskResult,
+		Parts:     []message.Part{message.TextPart{Text: "Cannot complete task: reviewer failed"}},
+		Metadata:  map[string]string{"task_id": "t1", "status": "failed"},
+		Timestamp: time.Now(),
+	})
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("dispatchLoopTask: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("timeout waiting for completion")
+	}
+
+	if graph.Tasks[0].Status != taskgraph.StatusFailed {
+		t.Errorf("status: got %q, want failed", graph.Tasks[0].Status)
+	}
+	if graph.Tasks[0].Result != "Cannot complete task: reviewer failed" {
+		t.Errorf("result: got %q", graph.Tasks[0].Result)
 	}
 
 	events.Close()
@@ -890,6 +1205,33 @@ func TestSchedulerCancelAllRunning(t *testing.T) {
 
 	if !cancelled["t1"] || !cancelled["t2"] {
 		t.Errorf("expected all tasks cancelled: %v", cancelled)
+	}
+}
+
+func TestEmitTaskHeartbeatIncludesPlacement(t *testing.T) {
+	events := event.NewBus()
+	s := &Scheduler{Events: events}
+	task := &taskgraph.TaskNode{
+		Agent:            "architect",
+		AssignedInstance: "node-5/architect",
+		ExecutionNode:    "node-5",
+	}
+
+	s.emitTaskHeartbeat(task)
+
+	select {
+	case evt := <-events:
+		if evt.Type != event.TaskProgress {
+			t.Fatalf("event type = %v, want TaskProgress", evt.Type)
+		}
+		if evt.TaskAgent != "architect" {
+			t.Fatalf("task agent = %q, want architect", evt.TaskAgent)
+		}
+		if evt.ProgressText != "Still working on node-5/architect via node-5" {
+			t.Fatalf("progress text = %q", evt.ProgressText)
+		}
+	default:
+		t.Fatal("expected task heartbeat event")
 	}
 }
 
@@ -1287,6 +1629,511 @@ func TestTryAcquireAgentUnknown(t *testing.T) {
 
 	if !s.tryAcquireAgent("nonexistent") {
 		t.Fatal("unknown agent should be unlimited")
+	}
+}
+
+func TestSchedulerAssignsRemoteInstanceAndReleasesLease(t *testing.T) {
+	hub := local.NewHub()
+	conductorComm := hub.Register("conductor")
+	agentComm := hub.Register("developer")
+	store := controlplane.NewMemoryStore("test-fabric")
+
+	ctx := context.Background()
+	if err := store.RegisterNode(ctx, controlplane.Node{
+		ID:              "node-a",
+		State:           controlplane.NodeStateReady,
+		Labels:          map[string]string{"role": "node", "region": "us-east"},
+		Capacity:        controlplane.NodeCapacity{MaxTasks: 2},
+		LastHeartbeatAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("RegisterNode node-a: %v", err)
+	}
+	if err := store.RegisterNode(ctx, controlplane.Node{
+		ID:              "node-b",
+		State:           controlplane.NodeStateReady,
+		Labels:          map[string]string{"role": "node", "region": "us-west"},
+		Capacity:        controlplane.NodeCapacity{MaxTasks: 2},
+		LastHeartbeatAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("RegisterNode node-b: %v", err)
+	}
+	if err := store.RegisterInstance(ctx, controlplane.AgentInstance{
+		ID:              "node-a/developer/1",
+		Profile:         "developer",
+		NodeID:          "node-a",
+		Endpoint:        runtime.Endpoint{Address: "10.0.0.1:6001"},
+		State:           controlplane.InstanceStateReady,
+		LastHeartbeatAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("RegisterInstance ready: %v", err)
+	}
+	if err := store.RegisterInstance(ctx, controlplane.AgentInstance{
+		ID:              "node-b/developer/1",
+		Profile:         "developer",
+		NodeID:          "node-b",
+		Endpoint:        runtime.Endpoint{Address: "10.0.0.2:6001"},
+		State:           controlplane.InstanceStateBusy,
+		LastHeartbeatAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("RegisterInstance busy: %v", err)
+	}
+
+	graph := &taskgraph.TaskGraph{
+		RequestID: "req-placement",
+		Tasks: []*taskgraph.TaskNode{
+			{
+				ID:          "t1",
+				Agent:       "developer",
+				Description: "Implement the API",
+				Status:      taskgraph.StatusRunning,
+			},
+		},
+	}
+
+	s := &Scheduler{
+		Comm:         conductorComm,
+		ControlPlane: store,
+		RequestID:    "req-placement",
+		LeaseOwnerID: "conductor-test",
+		Agents: []runtime.AgentDefinition{
+			{Name: "developer"},
+		},
+	}
+
+	runCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- s.dispatchTask(runCtx, graph.Tasks[0], graph)
+	}()
+
+	select {
+	case msg := <-agentComm.Receive(runCtx):
+		if msg.Metadata["assigned_instance"] != "node-a/developer/1" {
+			t.Fatalf("assigned instance = %q, want node-a/developer/1", msg.Metadata["assigned_instance"])
+		}
+		if msg.Metadata["execution_node"] != "node-a" {
+			t.Fatalf("execution node = %q, want node-a", msg.Metadata["execution_node"])
+		}
+		if msg.Metadata["lease_epoch"] == "" {
+			t.Fatal("expected lease_epoch metadata to be set")
+		}
+
+		agentComm.Send(runCtx, &message.Message{
+			ID:        "r1",
+			RequestID: "req-placement",
+			From:      "developer",
+			To:        "conductor",
+			Type:      message.TypeTaskResult,
+			Parts:     []message.Part{message.TextPart{Text: "done"}},
+			Metadata:  map[string]string{"task_id": "t1"},
+			Timestamp: time.Now(),
+		})
+	case <-runCtx.Done():
+		t.Fatal("timeout waiting for task dispatch")
+	}
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("dispatchTask: %v", err)
+		}
+	case <-runCtx.Done():
+		t.Fatal("timeout waiting for dispatchTask")
+	}
+
+	task := graph.Tasks[0]
+	if task.AssignedInstance != "node-a/developer/1" {
+		t.Fatalf("task assigned instance = %q, want node-a/developer/1", task.AssignedInstance)
+	}
+	if task.ExecutionNode != "node-a" {
+		t.Fatalf("task execution node = %q, want node-a", task.ExecutionNode)
+	}
+	if task.LeaseEpoch == 0 {
+		t.Fatal("expected task lease epoch to be set")
+	}
+	if _, ok, err := store.GetTaskLease(ctx, "req-placement", "t1"); err != nil {
+		t.Fatalf("GetTaskLease: %v", err)
+	} else if ok {
+		t.Fatal("expected task lease to be released after dispatch completion")
+	}
+	if _, ok, err := store.GetProfileLease(ctx, "developer"); err != nil {
+		t.Fatalf("GetProfileLease: %v", err)
+	} else if ok {
+		t.Fatal("expected profile lease to be released after dispatch completion")
+	}
+}
+
+func TestSchedulerRedispatchesAfterAssignedInstanceExpires(t *testing.T) {
+	hub := local.NewHub()
+	conductorComm := hub.Register("conductor")
+	agentComm := hub.Register("developer")
+	store := controlplane.NewMemoryStore("test-fabric")
+
+	ctx := context.Background()
+	now := time.Now().UTC()
+	if err := store.RegisterNode(ctx, controlplane.Node{
+		ID:              "node-a",
+		State:           controlplane.NodeStateReady,
+		Capacity:        controlplane.NodeCapacity{MaxTasks: 2},
+		LastHeartbeatAt: now,
+	}); err != nil {
+		t.Fatalf("RegisterNode node-a: %v", err)
+	}
+	if err := store.RegisterNode(ctx, controlplane.Node{
+		ID:              "node-b",
+		State:           controlplane.NodeStateReady,
+		Capacity:        controlplane.NodeCapacity{MaxTasks: 2},
+		LastHeartbeatAt: now,
+	}); err != nil {
+		t.Fatalf("RegisterNode node-b: %v", err)
+	}
+	if err := store.RegisterInstance(ctx, controlplane.AgentInstance{
+		ID:              "node-a/developer/1",
+		Profile:         "developer",
+		NodeID:          "node-a",
+		Endpoint:        runtime.Endpoint{Address: "10.0.0.1:6001"},
+		State:           controlplane.InstanceStateReady,
+		LastHeartbeatAt: now,
+	}); err != nil {
+		t.Fatalf("RegisterInstance node-a: %v", err)
+	}
+	if err := store.RegisterInstance(ctx, controlplane.AgentInstance{
+		ID:              "node-b/developer/1",
+		Profile:         "developer",
+		NodeID:          "node-b",
+		Endpoint:        runtime.Endpoint{Address: "10.0.0.2:6001"},
+		State:           controlplane.InstanceStateReady,
+		LastHeartbeatAt: now,
+	}); err != nil {
+		t.Fatalf("RegisterInstance node-b: %v", err)
+	}
+
+	graph := &taskgraph.TaskGraph{
+		RequestID: "req-recovery",
+		Tasks: []*taskgraph.TaskNode{
+			{
+				ID:          "t1",
+				Agent:       "developer",
+				Description: "Implement the API",
+				Status:      taskgraph.StatusPending,
+			},
+		},
+	}
+
+	s := &Scheduler{
+		Comm:         conductorComm,
+		ControlPlane: store,
+		RequestID:    "req-recovery",
+		LeaseOwnerID: "conductor-test",
+		Agents: []runtime.AgentDefinition{
+			{Name: "developer"},
+		},
+	}
+
+	runCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- s.Execute(runCtx, graph)
+	}()
+
+	msgCh := agentComm.Receive(runCtx)
+
+	var firstMsg *message.Message
+	select {
+	case firstMsg = <-msgCh:
+	case <-runCtx.Done():
+		t.Fatal("timeout waiting for first dispatch")
+	}
+	if firstMsg.Metadata["assigned_instance"] != "node-a/developer/1" {
+		t.Fatalf("first assigned instance = %q, want node-a/developer/1", firstMsg.Metadata["assigned_instance"])
+	}
+
+	staleAt := time.Now().UTC().Add(-controlplane.InstanceHeartbeatTTL - time.Second)
+	if err := store.RegisterInstance(ctx, controlplane.AgentInstance{
+		ID:              "node-a/developer/1",
+		Profile:         "developer",
+		NodeID:          "node-a",
+		Endpoint:        runtime.Endpoint{Address: "10.0.0.1:6001"},
+		State:           controlplane.InstanceStateReady,
+		LastHeartbeatAt: staleAt,
+	}); err != nil {
+		t.Fatalf("RegisterInstance stale node-a: %v", err)
+	}
+
+	var secondMsg *message.Message
+	select {
+	case secondMsg = <-msgCh:
+	case <-runCtx.Done():
+		t.Fatal("timeout waiting for redispatch")
+	}
+	if secondMsg.Metadata["assigned_instance"] != "node-b/developer/1" {
+		t.Fatalf("second assigned instance = %q, want node-b/developer/1", secondMsg.Metadata["assigned_instance"])
+	}
+
+	agentComm.Send(runCtx, &message.Message{
+		ID:        "r1",
+		RequestID: "req-recovery",
+		From:      "developer",
+		To:        "conductor",
+		Type:      message.TypeTaskResult,
+		Parts:     []message.Part{message.TextPart{Text: "done"}},
+		Metadata: map[string]string{
+			"task_id":        "t1",
+			"dispatch_nonce": secondMsg.Metadata["dispatch_nonce"],
+		},
+		Timestamp: time.Now(),
+	})
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("Execute: %v", err)
+		}
+	case <-runCtx.Done():
+		t.Fatal("timeout waiting for Execute")
+	}
+
+	task := graph.Tasks[0]
+	if task.Status != taskgraph.StatusCompleted {
+		t.Fatalf("task status = %q, want completed", task.Status)
+	}
+	if task.AssignedInstance != "node-b/developer/1" {
+		t.Fatalf("task assigned instance = %q, want node-b/developer/1", task.AssignedInstance)
+	}
+}
+
+func TestSchedulerSelectTaskInstanceHonorsRequiredNodeLabels(t *testing.T) {
+	store := controlplane.NewMemoryStore("test-fabric")
+	ctx := context.Background()
+
+	if err := store.RegisterNode(ctx, controlplane.Node{
+		ID:              "node-a",
+		State:           controlplane.NodeStateReady,
+		Labels:          map[string]string{"region": "us-east", "accelerator": "gpu"},
+		Capacity:        controlplane.NodeCapacity{MaxTasks: 2},
+		LastHeartbeatAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("RegisterNode node-a: %v", err)
+	}
+	if err := store.RegisterNode(ctx, controlplane.Node{
+		ID:              "node-b",
+		State:           controlplane.NodeStateReady,
+		Labels:          map[string]string{"region": "us-west"},
+		Capacity:        controlplane.NodeCapacity{MaxTasks: 2},
+		LastHeartbeatAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("RegisterNode node-b: %v", err)
+	}
+
+	instances := []controlplane.AgentInstance{
+		{
+			ID:              "node-a/developer/1",
+			Profile:         "developer",
+			NodeID:          "node-a",
+			Endpoint:        runtime.Endpoint{Address: "10.0.0.1:6001"},
+			State:           controlplane.InstanceStateReady,
+			LastHeartbeatAt: time.Now().UTC(),
+		},
+		{
+			ID:              "node-b/developer/1",
+			Profile:         "developer",
+			NodeID:          "node-b",
+			Endpoint:        runtime.Endpoint{Address: "10.0.0.2:6001"},
+			State:           controlplane.InstanceStateReady,
+			LastHeartbeatAt: time.Now().UTC(),
+		},
+	}
+
+	s := &Scheduler{
+		ControlPlane: store,
+		Agents: []runtime.AgentDefinition{
+			{
+				Name: "developer",
+				RequiredNodeLabels: map[string]string{
+					"accelerator": "gpu",
+				},
+			},
+		},
+	}
+
+	instance, ok, err := s.selectTaskInstance(context.Background(), &taskgraph.TaskNode{Agent: "developer"}, instances)
+	if err != nil {
+		t.Fatalf("selectTaskInstance: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected instance selection to succeed")
+	}
+	if instance.ID != "node-a/developer/1" {
+		t.Fatalf("selected instance = %q, want node-a/developer/1", instance.ID)
+	}
+}
+
+func TestSchedulerSelectTaskInstanceHonorsNodeTaskCapacity(t *testing.T) {
+	store := controlplane.NewMemoryStore("test-fabric")
+	ctx := context.Background()
+
+	if err := store.RegisterNode(ctx, controlplane.Node{
+		ID:              "node-a",
+		State:           controlplane.NodeStateReady,
+		Capacity:        controlplane.NodeCapacity{MaxTasks: 1},
+		LastHeartbeatAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("RegisterNode node-a: %v", err)
+	}
+	if err := store.RegisterNode(ctx, controlplane.Node{
+		ID:              "node-b",
+		State:           controlplane.NodeStateReady,
+		Capacity:        controlplane.NodeCapacity{MaxTasks: 2},
+		LastHeartbeatAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("RegisterNode node-b: %v", err)
+	}
+
+	instances := []controlplane.AgentInstance{
+		{
+			ID:              "node-a/developer/1",
+			Profile:         "developer",
+			NodeID:          "node-a",
+			Endpoint:        runtime.Endpoint{Address: "10.0.0.1:6001"},
+			State:           controlplane.InstanceStateReady,
+			LastHeartbeatAt: time.Now().UTC(),
+		},
+		{
+			ID:              "node-b/developer/1",
+			Profile:         "developer",
+			NodeID:          "node-b",
+			Endpoint:        runtime.Endpoint{Address: "10.0.0.2:6001"},
+			State:           controlplane.InstanceStateReady,
+			LastHeartbeatAt: time.Now().UTC(),
+		},
+	}
+
+	s := &Scheduler{
+		ControlPlane:     store,
+		instanceInFlight: map[string]int{"node-a/developer/1": 1},
+		nodeInFlight:     map[string]int{"node-a": 1},
+	}
+
+	instance, ok, err := s.selectTaskInstance(context.Background(), &taskgraph.TaskNode{Agent: "developer"}, instances)
+	if err != nil {
+		t.Fatalf("selectTaskInstance: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected instance selection to succeed")
+	}
+	if instance.ID != "node-b/developer/1" {
+		t.Fatalf("selected instance = %q, want node-b/developer/1", instance.ID)
+	}
+}
+
+func TestSchedulerSelectTaskInstanceSpreadsRequestAcrossNodes(t *testing.T) {
+	store := controlplane.NewMemoryStore("test-fabric")
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	for _, nodeID := range []string{"node-a", "node-b"} {
+		if err := store.RegisterNode(ctx, controlplane.Node{
+			ID:              nodeID,
+			State:           controlplane.NodeStateReady,
+			Capacity:        controlplane.NodeCapacity{MaxTasks: 2},
+			LastHeartbeatAt: now,
+		}); err != nil {
+			t.Fatalf("RegisterNode %s: %v", nodeID, err)
+		}
+	}
+
+	instances := []controlplane.AgentInstance{
+		{
+			ID:              "node-a/designer/1",
+			Profile:         "designer",
+			NodeID:          "node-a",
+			Endpoint:        runtime.Endpoint{Address: "10.0.0.1:6001"},
+			State:           controlplane.InstanceStateReady,
+			LastHeartbeatAt: now,
+		},
+		{
+			ID:              "node-b/designer/1",
+			Profile:         "designer",
+			NodeID:          "node-b",
+			Endpoint:        runtime.Endpoint{Address: "10.0.0.2:6001"},
+			State:           controlplane.InstanceStateReady,
+			LastHeartbeatAt: now,
+		},
+	}
+
+	graph := &taskgraph.TaskGraph{
+		RequestID: "req-spread",
+		Tasks: []*taskgraph.TaskNode{
+			{
+				ID:            "t1",
+				Agent:         "architect",
+				Status:        taskgraph.StatusCompleted,
+				ExecutionNode: "node-a",
+			},
+			{
+				ID:     "t2",
+				Agent:  "designer",
+				Status: taskgraph.StatusPending,
+			},
+		},
+	}
+
+	s := &Scheduler{
+		ControlPlane: store,
+		graph:        graph,
+	}
+
+	instance, ok, err := s.selectTaskInstance(context.Background(), graph.Tasks[1], instances)
+	if err != nil {
+		t.Fatalf("selectTaskInstance: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected instance selection to succeed")
+	}
+	if instance.ID != "node-b/designer/1" {
+		t.Fatalf("selected instance = %q, want node-b/designer/1", instance.ID)
+	}
+}
+
+type blockingListNodesStore struct {
+	controlplane.Store
+}
+
+func (s *blockingListNodesStore) ListNodes(ctx context.Context) ([]controlplane.Node, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func TestSchedulerSelectTaskInstanceHonorsContextDuringNodeLookup(t *testing.T) {
+	store := &blockingListNodesStore{
+		Store: controlplane.NewMemoryStore("test-fabric"),
+	}
+
+	instances := []controlplane.AgentInstance{
+		{
+			ID:              "node-a/developer/1",
+			Profile:         "developer",
+			NodeID:          "node-a",
+			Endpoint:        runtime.Endpoint{Address: "10.0.0.1:6001"},
+			State:           controlplane.InstanceStateReady,
+			LastHeartbeatAt: time.Now().UTC(),
+		},
+	}
+
+	s := &Scheduler{
+		ControlPlane: store,
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, _, err := s.selectTaskInstance(ctx, &taskgraph.TaskNode{Agent: "developer"}, instances)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("selectTaskInstance error = %v, want context canceled", err)
 	}
 }
 

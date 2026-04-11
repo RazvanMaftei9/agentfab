@@ -56,17 +56,16 @@ func TestResolveAgentsFromEmbedded(t *testing.T) {
 	}
 }
 
-func TestResolveAgentsSkipsWhenPopulated(t *testing.T) {
+func TestResolveAgentsAlwaysLoadsFromDir(t *testing.T) {
 	td := &FabricDef{
 		Fabric: FabricMeta{Name: "test", Version: 1},
-		Agents: DefaultProfiles(),
+		// No AgentsDir set — should fall back to embedded defaults.
 	}
-	orig := len(td.Agents)
 	if err := td.ResolveAgents(); err != nil {
 		t.Fatalf("resolve: %v", err)
 	}
-	if len(td.Agents) != orig {
-		t.Errorf("agents changed: got %d, want %d", len(td.Agents), orig)
+	if len(td.Agents) != 4 {
+		t.Errorf("expected 4 agents from embedded fallback, got %d", len(td.Agents))
 	}
 }
 
@@ -100,6 +99,79 @@ func TestFabricDefinitionFileRoundTrip(t *testing.T) {
 	}
 	if len(loaded.Agents) != len(td.Agents) {
 		t.Errorf("agents count: got %d, want %d", len(loaded.Agents), len(td.Agents))
+	}
+}
+
+func TestFabricDefinitionControlPlaneRoundTrip(t *testing.T) {
+	td := DefaultFabricDef("cp-test")
+	td.ControlPlane = FabricControlPlane{
+		Backend: "etcd",
+		API: FabricControlPlaneAPI{
+			Address:       "cp.agentfab.internal:50051",
+			ListenAddress: ":50051",
+		},
+		Etcd: FabricControlPlaneEtcd{
+			Endpoints:   []string{"http://127.0.0.1:2379", "http://127.0.0.1:2381"},
+			DialTimeout: "7s",
+		},
+	}
+	td.Storage = FabricStorage{
+		SharedRoot:  "/mnt/shared",
+		AgentRoot:   "/mnt/agents",
+		ScratchRoot: "/mnt/scratch",
+	}
+	td.Identity = FabricIdentity{
+		Provider:    "mounted",
+		TrustDomain: "spiffe.example.internal",
+		Mounted: FabricMountedIdentity{
+			CertFile:   "/var/run/agentfab/cert.pem",
+			KeyFile:    "/var/run/agentfab/key.pem",
+			BundleFile: "/var/run/agentfab/bundle.pem",
+		},
+	}
+
+	data, err := MarshalFabricDef(td)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	parsed, err := ParseFabricDef(data)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+
+	if parsed.ControlPlane.Backend != "etcd" {
+		t.Fatalf("backend = %q, want etcd", parsed.ControlPlane.Backend)
+	}
+	if parsed.ControlPlane.API.Address != "cp.agentfab.internal:50051" {
+		t.Fatalf("api address = %q, want cp.agentfab.internal:50051", parsed.ControlPlane.API.Address)
+	}
+	if parsed.ControlPlane.API.ListenAddress != ":50051" {
+		t.Fatalf("listen address = %q, want :50051", parsed.ControlPlane.API.ListenAddress)
+	}
+	if len(parsed.ControlPlane.Etcd.Endpoints) != 2 {
+		t.Fatalf("endpoints = %v, want 2 endpoints", parsed.ControlPlane.Etcd.Endpoints)
+	}
+	if parsed.ControlPlane.Etcd.DialTimeout != "7s" {
+		t.Fatalf("dial timeout = %q, want 7s", parsed.ControlPlane.Etcd.DialTimeout)
+	}
+	if parsed.Storage.SharedRoot != "/mnt/shared" {
+		t.Fatalf("shared root = %q, want /mnt/shared", parsed.Storage.SharedRoot)
+	}
+	if parsed.Storage.AgentRoot != "/mnt/agents" {
+		t.Fatalf("agent root = %q, want /mnt/agents", parsed.Storage.AgentRoot)
+	}
+	if parsed.Storage.ScratchRoot != "/mnt/scratch" {
+		t.Fatalf("scratch root = %q, want /mnt/scratch", parsed.Storage.ScratchRoot)
+	}
+	if parsed.Identity.Provider != "mounted" {
+		t.Fatalf("identity provider = %q, want mounted", parsed.Identity.Provider)
+	}
+	if parsed.Identity.TrustDomain != "spiffe.example.internal" {
+		t.Fatalf("identity trust domain = %q, want spiffe.example.internal", parsed.Identity.TrustDomain)
+	}
+	if parsed.Identity.Mounted.CertFile != "/var/run/agentfab/cert.pem" {
+		t.Fatalf("identity cert file = %q, want /var/run/agentfab/cert.pem", parsed.Identity.Mounted.CertFile)
 	}
 }
 

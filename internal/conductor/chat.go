@@ -4,9 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io/fs"
 	"log/slog"
-	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -261,9 +259,12 @@ func (c *Conductor) Chat(ctx context.Context, req ChatRequest) (*ChatResponse, e
 }
 
 func (c *Conductor) chatGenerateWithTools(ctx context.Context, agentDef runtime.AgentDefinition, input []*schema.Message) (*schema.Message, int, error) {
-	generate, toolExec, err := c.buildChatGenerator(ctx, agentDef)
+	generate, toolExec, closeWorkspace, err := c.buildChatGenerator(ctx, agentDef)
 	if err != nil {
 		return nil, 0, err
+	}
+	if closeWorkspace != nil {
+		defer closeWorkspace()
 	}
 	if toolExec == nil {
 		resp, err := generate(ctx, input)
@@ -330,25 +331,38 @@ func (c *Conductor) buildChatGenerator(
 ) (
 	func(context.Context, []*schema.Message) (*schema.Message, error),
 	*agent.ToolExecutor,
+	func() error,
 	error,
 ) {
 	toolInfos := agent.BuildToolInfos(agentDef.Tools)
 	liveTools := agent.LiveTools(agentDef.Tools)
+	storage := c.StorageFactory(agentDef.Name)
+	var workspace *runtime.Workspace
+	var err error
+	if len(liveTools) > 0 {
+		workspace, err = runtime.OpenWorkspace(ctx, storage)
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("materialize workspace: %w", err)
+		}
+	}
 
 	var toolExec *agent.ToolExecutor
 	if len(liveTools) > 0 {
-		storage := c.StorageFactory(agentDef.Name)
 		toolExec = &agent.ToolExecutor{
-			Tools: liveTools,
-			TierPaths: []string{
-				storage.TierDir(runtime.TierScratch),
-				storage.TierDir(runtime.TierAgent),
-				storage.TierDir(runtime.TierShared),
-			},
+			Tools:           liveTools,
+			TierPaths:       workspace.TierPaths(),
 			AgentName:       agentDef.Name,
 			MaxOutputTokens: llm.MaxOutputTokens(agentDef.Model),
 			ContextLimit:    llm.ContextLimit(agentDef.Model),
+			SyncWorkspace:   workspace.Sync,
 		}
+	}
+
+	closeWorkspace := func() error {
+		if workspace == nil {
+			return nil
+		}
+		return workspace.Close()
 	}
 
 	generate := func(callCtx context.Context, input []*schema.Message) (*schema.Message, error) {
@@ -382,7 +396,7 @@ func (c *Conductor) buildChatGenerator(
 		return metered.Generate(callCtx, input)
 	}
 
-	return generate, toolExec, nil
+	return generate, toolExec, closeWorkspace, nil
 }
 
 func (c *Conductor) buildChatKnowledge(ctx context.Context, agentName, question string) string {
@@ -725,51 +739,43 @@ func extractPseudoToolCalls(content string) []schema.ToolCall {
 
 func (c *Conductor) persistChatScratch(ctx context.Context, agentName string) {
 	storage := c.StorageFactory(agentName)
-	scratchDir := storage.TierDir(runtime.TierScratch)
-
-	if _, err := os.Stat(scratchDir); err != nil {
+	files, err := storage.ListAll(ctx, runtime.TierScratch, "")
+	if err != nil || len(files) == 0 {
 		return
 	}
 
 	const maxFileSize = 1 << 20 // 1MB
-	skipDirs := map[string]bool{
-		"node_modules": true, ".git": true, "dist": true, "build": true,
-		".next": true, "__pycache__": true, "vendor": true, ".cache": true,
-		"coverage": true, ".vite": true, "_requests": true, ".tool-results": true,
-	}
-
 	persisted := 0
 	artifactDir := "artifacts/" + agentName
 
-	_ = filepath.WalkDir(scratchDir, func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return nil
+	for _, rel := range files {
+		if rel == "" {
+			continue
 		}
-		rel, relErr := filepath.Rel(scratchDir, path)
-		if relErr != nil || rel == "." {
-			return nil
+		lower := strings.ToLower(filepath.ToSlash(rel))
+		if strings.Contains(lower, "node_modules/") ||
+			strings.Contains(lower, "/.git/") ||
+			strings.Contains(lower, "dist/") ||
+			strings.Contains(lower, "build/") ||
+			strings.Contains(lower, ".next/") ||
+			strings.Contains(lower, "__pycache__/") ||
+			strings.Contains(lower, "vendor/") ||
+			strings.Contains(lower, ".cache/") ||
+			strings.Contains(lower, "coverage/") ||
+			strings.Contains(lower, ".vite/") ||
+			strings.Contains(lower, "_requests/") ||
+			strings.Contains(lower, ".tool-results/") {
+			continue
 		}
-		if d.IsDir() {
-			if skipDirs[strings.ToLower(d.Name())] {
-				return fs.SkipDir
-			}
-			return nil
-		}
-
 		// Skip hidden files, logs, and sandbox temp files.
 		base := filepath.Base(rel)
 		if strings.HasPrefix(base, ".") {
-			return nil
+			continue
 		}
 
-		info, infoErr := d.Info()
-		if infoErr != nil || info.Size() > maxFileSize || info.Size() == 0 {
-			return nil
-		}
-
-		data, readErr := os.ReadFile(path)
-		if readErr != nil {
-			return nil
+		data, readErr := storage.Read(ctx, runtime.TierScratch, rel)
+		if readErr != nil || len(data) == 0 || len(data) > maxFileSize {
+			continue
 		}
 
 		storagePath := artifactDir + "/" + filepath.ToSlash(rel)
@@ -778,8 +784,7 @@ func (c *Conductor) persistChatScratch(ctx context.Context, agentName string) {
 		} else {
 			persisted++
 		}
-		return nil
-	})
+	}
 
 	if persisted > 0 {
 		slog.Info("persisted chat scratch files to shared storage",

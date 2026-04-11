@@ -1,0 +1,353 @@
+syntax = "proto3";
+
+package agentfab.v1;
+
+option go_package = "github.com/razvanmaftei/agentfab/gen/agentfab/v1;agentfabv1";
+
+import "google/protobuf/empty.proto";
+
+service ControlPlaneService {
+  rpc AttestNode(AttestNodeRequest) returns (AttestNodeResponse);
+  rpc RegisterNode(RegisterNodeRequest) returns (google.protobuf.Empty);
+  rpc HeartbeatNode(HeartbeatNodeRequest) returns (google.protobuf.Empty);
+  rpc GetNode(GetNodeRequest) returns (GetNodeResponse);
+  rpc ListNodes(ListNodesRequest) returns (ListNodesResponse);
+  rpc RegisterInstance(RegisterInstanceRequest) returns (google.protobuf.Empty);
+  rpc HeartbeatInstance(HeartbeatInstanceRequest) returns (google.protobuf.Empty);
+  rpc GetInstance(GetInstanceRequest) returns (GetInstanceResponse);
+  rpc ListInstances(ListInstancesRequest) returns (ListInstancesResponse);
+  rpc RemoveInstance(RemoveInstanceRequest) returns (google.protobuf.Empty);
+  rpc AcquireLeader(AcquireLeaderRequest) returns (AcquireLeaderResponse);
+  rpc RenewLeader(RenewLeaderRequest) returns (RenewLeaderResponse);
+  rpc ReleaseLeader(ReleaseLeaderRequest) returns (google.protobuf.Empty);
+  rpc GetLeader(GetLeaderRequest) returns (GetLeaderResponse);
+  rpc ResolveEndpoint(ResolveEndpointRequest) returns (ResolveEndpointResponse);
+  rpc ListParticipants(ListParticipantsRequest) returns (ListParticipantsResponse);
+  rpc UpsertRequest(UpsertRequestRequest) returns (google.protobuf.Empty);
+  rpc GetRequest(GetRequestRequest) returns (GetRequestResponse);
+  rpc ListRequests(ListRequestsRequest) returns (ListRequestsResponse);
+  rpc UpsertTask(UpsertTaskRequest) returns (google.protobuf.Empty);
+  rpc ListTasks(ListTasksRequest) returns (ListTasksResponse);
+  rpc AcquireProfileLease(AcquireProfileLeaseRequest) returns (AcquireProfileLeaseResponse);
+  rpc RenewProfileLease(RenewProfileLeaseRequest) returns (RenewProfileLeaseResponse);
+  rpc GetProfileLease(GetProfileLeaseRequest) returns (GetProfileLeaseResponse);
+  rpc ReleaseProfileLease(ReleaseProfileLeaseRequest) returns (google.protobuf.Empty);
+  rpc AcquireTaskLease(AcquireTaskLeaseRequest) returns (AcquireTaskLeaseResponse);
+  rpc RenewTaskLease(RenewTaskLeaseRequest) returns (RenewTaskLeaseResponse);
+  rpc GetTaskLease(GetTaskLeaseRequest) returns (GetTaskLeaseResponse);
+  rpc ReleaseTaskLease(ReleaseTaskLeaseRequest) returns (google.protobuf.Empty);
+}
+
+message AttestNodeRequest {
+  string type = 1;
+  map<string, string> claims = 2;
+  map<string, string> measurements = 3;
+  string token = 4;
+}
+
+message AttestNodeResponse {
+  string node_id = 1;
+  string trust_domain = 2;
+  map<string, string> claims = 3;
+  map<string, string> measurements = 4;
+  int64 attested_at_unix_nano = 5;
+  int64 expires_at_unix_nano = 6;
+}
+
+message RegisterNodeRequest {
+  string node_id = 1;
+  string address = 2;
+  string state = 3;
+  map<string, string> labels = 4;
+  int32 max_instances = 5;
+  int32 max_tasks = 6;
+  int64 started_at_unix_nano = 7;
+  int64 last_heartbeat_at_unix_nano = 8;
+  string bundle_digest = 9;
+  map<string, string> profile_digests = 10;
+}
+
+message HeartbeatNodeRequest {
+  string node_id = 1;
+  int64 at_unix_nano = 2;
+}
+
+message GetNodeRequest {
+  string node_id = 1;
+}
+
+message GetNodeResponse {
+  bool found = 1;
+  NodeView node = 2;
+}
+
+message ListNodesRequest {}
+
+message ListNodesResponse {
+  repeated NodeView nodes = 1;
+}
+
+message RegisterInstanceRequest {
+  string instance_id = 1;
+  string profile = 2;
+  string node_id = 3;
+  string endpoint_address = 4;
+  bool endpoint_local = 5;
+  string state = 6;
+  int64 started_at_unix_nano = 7;
+  int64 last_heartbeat_at_unix_nano = 8;
+  string bundle_digest = 9;
+  string profile_digest = 10;
+}
+
+message HeartbeatInstanceRequest {
+  string instance_id = 1;
+  int64 at_unix_nano = 2;
+}
+
+message GetInstanceRequest {
+  string instance_id = 1;
+}
+
+message GetInstanceResponse {
+  bool found = 1;
+  InstanceView instance = 2;
+}
+
+message ListInstancesRequest {
+  string profile = 1;
+  string node_id = 2;
+  string state = 3;
+}
+
+message ListInstancesResponse {
+  repeated InstanceView instances = 1;
+}
+
+message RemoveInstanceRequest {
+  string instance_id = 1;
+}
+
+message AcquireLeaderRequest {
+  string candidate_id = 1;
+  string candidate_address = 2;
+  int64 ttl_nanos = 3;
+}
+
+message AcquireLeaderResponse {
+  bool acquired = 1;
+  LeaderLeaseView leader = 2;
+}
+
+message RenewLeaderRequest {
+  LeaderLeaseView lease = 1;
+  int64 ttl_nanos = 2;
+}
+
+message RenewLeaderResponse {
+  LeaderLeaseView lease = 1;
+}
+
+message ReleaseLeaderRequest {
+  LeaderLeaseView lease = 1;
+}
+
+message GetLeaderRequest {}
+
+message GetLeaderResponse {
+  bool found = 1;
+  LeaderLeaseView leader = 2;
+}
+
+message ResolveEndpointRequest {
+  string name = 1;
+}
+
+message ResolveEndpointResponse {
+  bool found = 1;
+  string address = 2;
+  bool local = 3;
+}
+
+message ListParticipantsRequest {}
+
+message ListParticipantsResponse {
+  repeated string names = 1;
+}
+
+message UpsertRequestRequest {
+  RequestRecordView request = 1;
+}
+
+message GetRequestRequest {
+  string request_id = 1;
+}
+
+message GetRequestResponse {
+  bool found = 1;
+  RequestRecordView request = 2;
+}
+
+message ListRequestsRequest {}
+
+message ListRequestsResponse {
+  repeated RequestRecordView requests = 1;
+}
+
+message UpsertTaskRequest {
+  TaskRecordView task = 1;
+}
+
+message ListTasksRequest {
+  string request_id = 1;
+}
+
+message ListTasksResponse {
+  repeated TaskRecordView tasks = 1;
+}
+
+message AcquireProfileLeaseRequest {
+  ProfileLeaseView lease = 1;
+  int64 ttl_nanos = 2;
+}
+
+message AcquireProfileLeaseResponse {
+  bool acquired = 1;
+  ProfileLeaseView lease = 2;
+}
+
+message RenewProfileLeaseRequest {
+  ProfileLeaseView lease = 1;
+  int64 ttl_nanos = 2;
+}
+
+message RenewProfileLeaseResponse {
+  ProfileLeaseView lease = 1;
+}
+
+message GetProfileLeaseRequest {
+  string profile = 1;
+}
+
+message GetProfileLeaseResponse {
+  bool found = 1;
+  ProfileLeaseView lease = 2;
+}
+
+message ReleaseProfileLeaseRequest {
+  ProfileLeaseView lease = 1;
+}
+
+message AcquireTaskLeaseRequest {
+  TaskLeaseView lease = 1;
+  int64 ttl_nanos = 2;
+}
+
+message AcquireTaskLeaseResponse {
+  bool acquired = 1;
+  TaskLeaseView lease = 2;
+}
+
+message RenewTaskLeaseRequest {
+  TaskLeaseView lease = 1;
+  int64 ttl_nanos = 2;
+}
+
+message RenewTaskLeaseResponse {
+  TaskLeaseView lease = 1;
+}
+
+message GetTaskLeaseRequest {
+  string request_id = 1;
+  string task_id = 2;
+}
+
+message GetTaskLeaseResponse {
+  bool found = 1;
+  TaskLeaseView lease = 2;
+}
+
+message ReleaseTaskLeaseRequest {
+  TaskLeaseView lease = 1;
+}
+
+message LeaderLeaseView {
+  string fabric = 1;
+  string holder_id = 2;
+  string holder_address = 3;
+  int64 epoch = 4;
+  int64 acquired_at_unix_nano = 5;
+  int64 last_heartbeat_at_unix_nano = 6;
+  int64 expires_at_unix_nano = 7;
+}
+
+message RequestRecordView {
+  string id = 1;
+  string state = 2;
+  string user_request = 3;
+  int64 graph_version = 4;
+  string leader_id = 5;
+  int64 created_at_unix_nano = 6;
+  int64 updated_at_unix_nano = 7;
+}
+
+message TaskRecordView {
+  string request_id = 1;
+  string task_id = 2;
+  string profile = 3;
+  string assigned_instance = 4;
+  string execution_node = 5;
+  string status = 6;
+  int64 lease_epoch = 7;
+  int64 updated_at_unix_nano = 8;
+}
+
+message ProfileLeaseView {
+  string profile = 1;
+  string assigned_instance = 2;
+  string execution_node = 3;
+  string owner_id = 4;
+  int64 epoch = 5;
+  int64 acquired_at_unix_nano = 6;
+  int64 last_heartbeat_at_unix_nano = 7;
+  int64 expires_at_unix_nano = 8;
+}
+
+message TaskLeaseView {
+  string request_id = 1;
+  string task_id = 2;
+  string profile = 3;
+  string assigned_instance = 4;
+  string execution_node = 5;
+  string owner_id = 6;
+  int64 epoch = 7;
+  int64 acquired_at_unix_nano = 8;
+  int64 last_heartbeat_at_unix_nano = 9;
+  int64 expires_at_unix_nano = 10;
+}
+
+message NodeView {
+  string id = 1;
+  string address = 2;
+  string state = 3;
+  map<string, string> labels = 4;
+  string bundle_digest = 5;
+  map<string, string> profile_digests = 6;
+  int32 max_instances = 7;
+  int32 max_tasks = 8;
+  int64 started_at_unix_nano = 9;
+  int64 last_heartbeat_at_unix_nano = 10;
+}
+
+message InstanceView {
+  string id = 1;
+  string profile = 2;
+  string node_id = 3;
+  string bundle_digest = 4;
+  string profile_digest = 5;
+  string endpoint_address = 6;
+  bool endpoint_local = 7;
+  string state = 8;
+  int64 started_at_unix_nano = 9;
+  int64 last_heartbeat_at_unix_nano = 10;
+}

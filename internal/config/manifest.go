@@ -93,6 +93,14 @@ func ManifestPath(agentsDir string) string {
 	return filepath.Join(agentsDir, "manifest.json")
 }
 
+func VerifyAgentsManifest(agentsDir string) (ok bool, mismatches []string, err error) {
+	manifest, err := LoadManifest(ManifestPath(agentsDir))
+	if err != nil {
+		return false, nil, err
+	}
+	return VerifyManifest(agentsDir, manifest)
+}
+
 // VerifyManifest re-hashes files in agentsDir and compares against stored checksums.
 // Mismatches contains human-readable descriptions of differences.
 func VerifyManifest(agentsDir string, m *Manifest) (ok bool, mismatches []string, err error) {

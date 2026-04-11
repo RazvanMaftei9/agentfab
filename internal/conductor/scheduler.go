@@ -14,6 +14,7 @@ import (
 
 	"github.com/cloudwego/eino/schema"
 	"github.com/google/uuid"
+	"github.com/razvanmaftei/agentfab/internal/controlplane"
 	"github.com/razvanmaftei/agentfab/internal/event"
 	"github.com/razvanmaftei/agentfab/internal/knowledge"
 	"github.com/razvanmaftei/agentfab/internal/loop"
@@ -32,6 +33,7 @@ type UserQuery struct {
 // Scheduler dispatches tasks from a DAG and collects results.
 type Scheduler struct {
 	Comm           message.MessageCommunicator
+	ControlPlane   controlplane.Store
 	Logger         *message.Logger
 	Storage        runtime.Storage
 	Meter          runtime.ExtendedMeter
@@ -40,6 +42,7 @@ type Scheduler struct {
 	Events         event.Bus
 	Agents         []runtime.AgentDefinition
 	UserRequest    string
+	LeaseOwnerID   string
 	KnowledgeGraph *knowledge.Graph
 	AgentGraphs    map[string]*knowledge.Graph
 	// KnowledgeGenerate is used for incremental knowledge extraction while a request
@@ -70,11 +73,39 @@ type Scheduler struct {
 	knowledgeMu        sync.RWMutex
 	knowledgeRefreshMu sync.Mutex
 
-	inflightMu sync.Mutex
-	inflight   map[string]int // agent name → count of currently dispatched tasks
+	inflightMu       sync.Mutex
+	inflight         map[string]int // agent name → count of currently dispatched tasks
+	instanceInFlight map[string]int
+	nodeInFlight     map[string]int
 
 	nonceMu    sync.Mutex
 	taskNonces map[string]string // task ID → expected dispatch nonce
+}
+
+const (
+	taskLeaseTTL              = 30 * time.Second
+	taskLeaseRenewInterval    = 10 * time.Second
+	taskHealthCheckInterval   = 2 * time.Second
+	profileLeaseTTL           = 30 * time.Second
+	profileLeaseRenewInterval = 10 * time.Second
+	taskProgressHeartbeat     = 6 * time.Second
+	nodeLookupTimeout         = 2 * time.Second
+)
+
+type recoverableDispatchError struct {
+	reason string
+}
+
+func (e recoverableDispatchError) Error() string {
+	return e.reason
+}
+
+func isRecoverableDispatchError(err error) bool {
+	if err == nil {
+		return false
+	}
+	_, ok := err.(recoverableDispatchError)
+	return ok
 }
 
 // demux routes messages to per-task subscribers by task_id (not agent name)
@@ -176,9 +207,6 @@ func (s *Scheduler) runDemux(ctx context.Context) {
 			if !ok {
 				return
 			}
-			// StatusUpdate messages carry streaming progress from distributed
-			// agents. Convert to TaskProgress events for the UI instead of
-			// routing through the demux (they don't need task-based routing).
 			if msg.Type == message.TypeStatusUpdate && s.Events != nil {
 				for _, p := range msg.Parts {
 					if tp, ok := p.(message.TextPart); ok && tp.Text != "" {
@@ -190,7 +218,6 @@ func (s *Scheduler) runDemux(ctx context.Context) {
 						break
 					}
 				}
-				continue
 			}
 			s.demux.route(msg)
 		}
@@ -224,6 +251,20 @@ func (s *Scheduler) agentLimit(agent string) int {
 		}
 	}
 	return 0
+}
+
+func taskProfile(task *taskgraph.TaskNode) string {
+	if task == nil {
+		return ""
+	}
+	return task.TargetProfile()
+}
+
+func taskExecutionTarget(task *taskgraph.TaskNode) string {
+	if task == nil {
+		return ""
+	}
+	return task.ExecutionTarget()
 }
 
 // enrichLoopGuidelines copies ReviewPrompt and ReviewGuidelines from agent
@@ -260,6 +301,8 @@ func (s *Scheduler) Execute(ctx context.Context, graph *taskgraph.TaskGraph) err
 	s.graph = graph
 	s.taskCancels = make(map[string]context.CancelFunc)
 	s.inflight = make(map[string]int)
+	s.instanceInFlight = make(map[string]int)
+	s.nodeInFlight = make(map[string]int)
 	s.taskNonces = make(map[string]string)
 	if s.UserQueryCh == nil {
 		s.UserQueryCh = make(chan *UserQuery, 1)
@@ -272,6 +315,7 @@ func (s *Scheduler) Execute(ctx context.Context, graph *taskgraph.TaskGraph) err
 
 	// Start demux goroutine to fan out messages to per-agent waiters.
 	s.ensureDemux(ctx)
+	s.syncGraphState(ctx, graph)
 
 	// Write initial graph status.
 	s.writeGraphStatus(ctx, graph)
@@ -331,19 +375,22 @@ func (s *Scheduler) Execute(ctx context.Context, graph *taskgraph.TaskGraph) err
 			if dispatched[task.ID] {
 				continue
 			}
-			if !s.tryAcquireAgent(task.Agent) {
+			profile := taskProfile(task)
+			if !s.tryAcquireAgent(profile) {
 				continue // agent at capacity, try next iteration
 			}
 			dispatched[task.ID] = true
 			newDispatches++
 			pending++
 			task.Status = taskgraph.StatusRunning
+			s.syncTaskState(ctx, task)
 			s.logTaskStatus(ctx, task, "")
 			s.writeGraphStatus(ctx, graph)
 			startEvt := event.Event{
 				Type:            event.TaskStart,
 				TaskID:          task.ID,
-				TaskAgent:       task.Agent,
+				TaskAgent:       profile,
+				ExecutionNode:   task.ExecutionNode,
 				TaskDescription: task.Description,
 			}
 			s.attachUsage(ctx, &startEvt)
@@ -355,20 +402,21 @@ func (s *Scheduler) Execute(ctx context.Context, graph *taskgraph.TaskGraph) err
 			s.registerTaskCancel(task.ID, taskCancel)
 			go func(t *taskgraph.TaskNode, tCtx context.Context, tCancel context.CancelFunc) {
 				defer func() { doneCh <- t.ID }()
-				defer s.releaseAgent(t.Agent)
+				profile := taskProfile(t)
+				defer s.releaseAgent(profile)
 				defer func() {
 					tCancel()
 					s.unregisterTaskCancel(t.ID)
 				}()
 				start := time.Now()
-				inBefore, outBefore := s.agentUsageSnapshot(ctx, t.Agent)
+				inBefore, outBefore := s.agentUsageSnapshot(ctx, profile)
 				var err error
 				if t.LoopID != "" {
 					err = s.dispatchLoopTask(tCtx, t, graph)
 				} else {
 					err = s.dispatchTask(tCtx, t, graph)
 				}
-				inAfter, outAfter := s.agentUsageSnapshot(ctx, t.Agent)
+				inAfter, outAfter := s.agentUsageSnapshot(ctx, profile)
 				if err != nil {
 					if t.Status == taskgraph.StatusCancelled {
 						return
@@ -385,12 +433,13 @@ func (s *Scheduler) Execute(ctx context.Context, graph *taskgraph.TaskGraph) err
 					slog.Error("task dispatch failed", "task", t.ID, "error", err)
 					t.Status = taskgraph.StatusFailed
 					t.Result = err.Error()
+					s.syncTaskState(ctx, t)
 					s.logTaskStatus(ctx, t, err.Error())
 					s.writeGraphStatus(ctx, graph)
 					failEvt := event.Event{
 						Type:              event.TaskFailed,
 						TaskID:            t.ID,
-						TaskAgent:         t.Agent,
+						TaskAgent:         profile,
 						Duration:          time.Since(start),
 						ErrMsg:            err.Error(),
 						AgentInputTokens:  inAfter - inBefore,
@@ -400,23 +449,25 @@ func (s *Scheduler) Execute(ctx context.Context, graph *taskgraph.TaskGraph) err
 					s.Events.Emit(failEvt)
 					return
 				}
+				s.syncTaskState(ctx, t)
 				s.logTaskStatus(ctx, t, "")
 				s.writeGraphStatus(ctx, graph)
 				if t.Status == taskgraph.StatusFailed {
 					// Adaptive routing: try escalating to a higher-tier model.
 					if s.Router != nil {
-						s.Router.RecordOutcome(t.Agent, t.ID, false)
-						if s.Router.Escalate(t.Agent, t.ID) {
-							slog.Info("adaptive routing: escalating model tier", "task", t.ID, "agent", t.Agent)
+						s.Router.RecordOutcome(profile, t.ID, false)
+						if s.Router.Escalate(profile, t.ID) {
+							slog.Info("adaptive routing: escalating model tier", "task", t.ID, "agent", profile)
 							t.Status = taskgraph.StatusPending
 							t.Result = ""
+							s.syncTaskState(ctx, t)
 							return // task will be retried on next iteration
 						}
 					}
 					failEvt := event.Event{
 						Type:              event.TaskFailed,
 						TaskID:            t.ID,
-						TaskAgent:         t.Agent,
+						TaskAgent:         profile,
 						Duration:          time.Since(start),
 						ErrMsg:            t.Result,
 						AgentInputTokens:  inAfter - inBefore,
@@ -426,12 +477,12 @@ func (s *Scheduler) Execute(ctx context.Context, graph *taskgraph.TaskGraph) err
 					s.Events.Emit(failEvt)
 				} else {
 					if s.Router != nil {
-						s.Router.RecordOutcome(t.Agent, t.ID, true)
+						s.Router.RecordOutcome(profile, t.ID, true)
 					}
 					doneEvt := event.Event{
 						Type:              event.TaskComplete,
 						TaskID:            t.ID,
-						TaskAgent:         t.Agent,
+						TaskAgent:         profile,
 						Duration:          time.Since(start),
 						AgentInputTokens:  inAfter - inBefore,
 						AgentOutputTokens: outAfter - outBefore,
@@ -474,11 +525,12 @@ func (s *Scheduler) Execute(ctx context.Context, graph *taskgraph.TaskGraph) err
 				if t := graph.Get(taskID); t != nil && t.Status == taskgraph.StatusFailed {
 					for _, id := range graph.FailDependents(taskID) {
 						dep := graph.Get(id)
+						s.syncTaskState(ctx, dep)
 						s.logTaskStatus(ctx, dep, dep.Result)
 						cascadeEvt := event.Event{
 							Type:      event.TaskFailed,
 							TaskID:    id,
-							TaskAgent: dep.Agent,
+							TaskAgent: dep.TargetProfile(),
 							ErrMsg:    dep.Result,
 						}
 						s.attachUsage(ctx, &cascadeEvt)
@@ -498,11 +550,12 @@ func (s *Scheduler) Execute(ctx context.Context, graph *taskgraph.TaskGraph) err
 					if t := graph.Get(taskID); t != nil && t.Status == taskgraph.StatusFailed {
 						for _, id := range graph.FailDependents(taskID) {
 							dep := graph.Get(id)
+							s.syncTaskState(ctx, dep)
 							s.logTaskStatus(ctx, dep, dep.Result)
 							cascadeEvt := event.Event{
 								Type:      event.TaskFailed,
 								TaskID:    id,
-								TaskAgent: dep.Agent,
+								TaskAgent: dep.TargetProfile(),
 								ErrMsg:    dep.Result,
 							}
 							s.attachUsage(ctx, &cascadeEvt)
@@ -519,6 +572,7 @@ func (s *Scheduler) Execute(ctx context.Context, graph *taskgraph.TaskGraph) err
 
 	// Write final graph status.
 	s.writeGraphStatus(ctx, graph)
+	s.syncGraphState(ctx, graph)
 
 	slog.Info("scheduler complete", "request_id", graph.RequestID, "has_failures", graph.HasFailures())
 	return nil
@@ -545,7 +599,7 @@ func (s *Scheduler) logTaskStatus(ctx context.Context, task *taskgraph.TaskNode,
 		ID:        uuid.New().String(),
 		RequestID: s.RequestID,
 		From:      "conductor",
-		To:        task.Agent,
+		To:        taskProfile(task),
 		Type:      message.TypeStatusUpdate,
 		Parts: []message.Part{
 			message.TextPart{Text: fmt.Sprintf("Task %s: %s", task.ID, task.Status)},
@@ -567,12 +621,14 @@ type graphStatusEntry struct {
 }
 
 type taskStatusEntry struct {
-	ID          string `json:"id"`
-	Agent       string `json:"agent"`
-	Description string `json:"description"`
-	Status      string `json:"status"`
-	Error       string `json:"error,omitempty"`
-	ArtifactURI string `json:"artifact_uri,omitempty"`
+	ID               string `json:"id"`
+	Agent            string `json:"agent"`
+	AssignedInstance string `json:"assigned_instance,omitempty"`
+	ExecutionNode    string `json:"execution_node,omitempty"`
+	Description      string `json:"description"`
+	Status           string `json:"status"`
+	Error            string `json:"error,omitempty"`
+	ArtifactURI      string `json:"artifact_uri,omitempty"`
 }
 
 // writeGraphStatus writes the current task graph state to a status.json file
@@ -589,11 +645,13 @@ func (s *Scheduler) writeGraphStatus(ctx context.Context, graph *taskgraph.TaskG
 	}
 	for i, t := range graph.Tasks {
 		te := taskStatusEntry{
-			ID:          t.ID,
-			Agent:       t.Agent,
-			Description: t.Description,
-			Status:      string(t.Status),
-			ArtifactURI: t.ArtifactURI,
+			ID:               t.ID,
+			Agent:            t.TargetProfile(),
+			AssignedInstance: t.AssignedInstance,
+			ExecutionNode:    t.ExecutionNode,
+			Description:      t.Description,
+			Status:           string(t.Status),
+			ArtifactURI:      t.ArtifactURI,
 		}
 		if t.Status == taskgraph.StatusFailed && t.Result != "" {
 			te.Error = t.Result
@@ -683,6 +741,18 @@ func (s *Scheduler) dispatchTask(ctx context.Context, task *taskgraph.TaskNode, 
 	nonce := uuid.New().String()[:8]
 	s.setNonce(task.ID, nonce)
 	s.demux.clearOverflow(task.ID)
+	profile := taskProfile(task)
+	placement, err := s.prepareTaskPlacement(ctx, task)
+	if err != nil {
+		if isRecoverableDispatchError(err) {
+			s.prepareTaskForRedispatch(ctx, task)
+		}
+		return err
+	}
+	if placement != nil {
+		defer s.finishTaskPlacement(context.WithoutCancel(ctx), task, placement)
+	}
+	target := taskExecutionTarget(task)
 
 	// Build message parts: task description + pipeline context + dependency results.
 	parts := []message.Part{
@@ -716,7 +786,7 @@ func (s *Scheduler) dispatchTask(ctx context.Context, task *taskgraph.TaskNode, 
 	}
 
 	// Include existing artifacts so agents can iterate on prior work.
-	if existingParts := s.buildExistingArtifacts(ctx, task.Agent); len(existingParts) > 0 {
+	if existingParts := s.buildExistingArtifacts(ctx, profile); len(existingParts) > 0 {
 		parts = append(parts, existingParts...)
 	}
 
@@ -743,14 +813,14 @@ func (s *Scheduler) dispatchTask(ctx context.Context, task *taskgraph.TaskNode, 
 			// Also include a DataPart so buildTaskInput sees dependency metadata.
 			parts = append(parts, message.DataPart{Data: map[string]any{
 				"dependency_id":    dep.ID,
-				"dependency_agent": dep.Agent,
+				"dependency_agent": dep.TargetProfile(),
 			}})
 			continue
 		}
 
 		data := map[string]any{
 			"dependency_id":    dep.ID,
-			"dependency_agent": dep.Agent,
+			"dependency_agent": dep.TargetProfile(),
 		}
 		if dep.ArtifactURI != "" {
 			data["artifact_uri"] = dep.ArtifactURI
@@ -779,7 +849,7 @@ func (s *Scheduler) dispatchTask(ctx context.Context, task *taskgraph.TaskNode, 
 		ID:        uuid.New().String(),
 		RequestID: s.RequestID,
 		From:      "conductor",
-		To:        task.Agent,
+		To:        profile,
 		Type:      message.TypeTaskAssignment,
 		Parts:     parts,
 		Metadata: map[string]string{
@@ -789,18 +859,33 @@ func (s *Scheduler) dispatchTask(ctx context.Context, task *taskgraph.TaskNode, 
 		},
 		Timestamp: time.Now(),
 	}
+	if profile != "" {
+		msg.Metadata["profile"] = profile
+	}
+	if task.AssignedInstance != "" {
+		msg.Metadata["assigned_instance"] = task.AssignedInstance
+	}
+	if task.ExecutionNode != "" {
+		msg.Metadata["execution_node"] = task.ExecutionNode
+	}
+	if task.LeaseEpoch > 0 {
+		msg.Metadata["lease_epoch"] = fmt.Sprintf("%d", task.LeaseEpoch)
+	}
 
 	if s.Logger != nil {
 		s.Logger.Log(ctx, msg)
 	}
 
 	if err := s.Comm.Send(ctx, msg); err != nil {
-		return fmt.Errorf("send task to %q: %w", task.Agent, err)
+		return fmt.Errorf("send task to %q: %w", target, err)
 	}
 
 	// Wait for result.
 	result, err := s.waitForResult(ctx, task, nonce)
 	if err != nil {
+		if isRecoverableDispatchError(err) {
+			s.prepareTaskForRedispatch(ctx, task)
+		}
 		return err
 	}
 
@@ -808,9 +893,9 @@ func (s *Scheduler) dispatchTask(ctx context.Context, task *taskgraph.TaskNode, 
 	task.ArtifactURI = extractArtifactURI(result)
 	task.ArtifactFiles = extractArtifactFiles(result)
 
-	// In distributed mode, agents record LLM usage in their own meters.
-	// Feed the reported usage into the conductor's meter so aggregate
-	// totals include all agents.
+	// In gRPC-based runtimes, agents record LLM usage in their own meters.
+	// Feed the reported usage into the conductor's meter so aggregate totals
+	// include all agents.
 	s.recordRemoteUsage(ctx, result)
 
 	if result.Metadata != nil && result.Metadata["status"] == "failed" {
@@ -818,8 +903,638 @@ func (s *Scheduler) dispatchTask(ctx context.Context, task *taskgraph.TaskNode, 
 	} else {
 		task.Status = taskgraph.StatusCompleted
 	}
+	s.syncTaskState(ctx, task)
 
 	return nil
+}
+
+type taskPlacement struct {
+	instanceID         string
+	nodeID             string
+	taskLease          controlplane.TaskLease
+	cancelLeaseRenewal context.CancelFunc
+}
+
+type loopPlacement struct {
+	leases             []controlplane.ProfileLease
+	cancelLeaseRenewal context.CancelFunc
+}
+
+func (s *Scheduler) prepareTaskPlacement(ctx context.Context, task *taskgraph.TaskNode) (*taskPlacement, error) {
+	if s.ControlPlane == nil || task == nil || task.LoopID != "" {
+		return nil, nil
+	}
+
+	profile := task.TargetProfile()
+	if profile == "" {
+		return nil, nil
+	}
+
+	instances, err := s.ControlPlane.ListInstances(ctx, controlplane.InstanceFilter{Profile: profile})
+	if err != nil {
+		return nil, fmt.Errorf("list instances for profile %q: %w", profile, err)
+	}
+	if len(instances) == 0 {
+		task.AssignedInstance = ""
+		task.ExecutionNode = ""
+		task.LeaseEpoch = 0
+		return nil, nil
+	}
+
+	// Profile leases used to pin every dispatch for a profile to a single
+	// instance, which serialised parallel fan-out workloads. The profile lease
+	// guarded nothing real -- per-task artifacts are written to task-scoped
+	// paths, knowledge updates are already serialised by knowledgeRefreshMu
+	// and the conductor's single background apply goroutine, and same-task
+	// double-execution is prevented by the per-task lease below. Skip the
+	// profile lease entirely and let the scheduler's least-loaded sort do
+	// its job.
+	instance, ok, err := s.selectTaskInstance(ctx, task, instances)
+	if err != nil {
+		return nil, fmt.Errorf("select instance for profile %q: %w", profile, err)
+	}
+	if !ok {
+		// Every eligible instance is at capacity. This is a transient
+		// condition for fan-out workloads larger than current cluster
+		// headroom: as in-flight tasks complete, capacity frees up and the
+		// scheduler can retry. Surface as recoverable so the dispatcher
+		// requeues instead of failing the task hard.
+		return nil, recoverableDispatchError{reason: fmt.Sprintf("no routable instance available for profile %q (all at capacity)", profile)}
+	}
+
+	task.AssignedInstance = instance.ID
+	task.ExecutionNode = instance.NodeID
+	if s.Events != nil {
+		progress := "Running..."
+		if task.AssignedInstance != "" && task.ExecutionNode != "" {
+			progress = fmt.Sprintf("Running on %s via %s", task.AssignedInstance, task.ExecutionNode)
+		} else if task.ExecutionNode != "" {
+			progress = fmt.Sprintf("Running on node %s", task.ExecutionNode)
+		}
+		s.Events.Emit(event.Event{
+			Type:          event.TaskProgress,
+			TaskID:        task.ID,
+			TaskAgent:     profile,
+			ExecutionNode: task.ExecutionNode,
+			ProgressText:  progress,
+		})
+	}
+
+	taskLease, acquired, err := s.ControlPlane.AcquireTaskLease(ctx, controlplane.TaskLease{
+		RequestID:        s.RequestID,
+		TaskID:           task.ID,
+		Profile:          profile,
+		AssignedInstance: instance.ID,
+		ExecutionNode:    instance.NodeID,
+		OwnerID:          s.leaseOwnerID(),
+	}, taskLeaseTTL)
+	if err != nil {
+		return nil, fmt.Errorf("acquire task lease for %q: %w", task.ID, err)
+	}
+	if !acquired {
+		return nil, fmt.Errorf("task lease for %q is already held by %q", task.ID, taskLease.OwnerID)
+	}
+
+	task.LeaseEpoch = taskLease.Epoch
+	s.acquireInstance(instance.ID, instance.NodeID)
+
+	renewCtx, cancelRenew := context.WithCancel(ctx)
+	go s.runPlacementLeaseHeartbeat(renewCtx, task, taskLease)
+
+	return &taskPlacement{
+		instanceID:         instance.ID,
+		nodeID:             instance.NodeID,
+		taskLease:          taskLease,
+		cancelLeaseRenewal: cancelRenew,
+	}, nil
+}
+
+func (s *Scheduler) finishTaskPlacement(ctx context.Context, task *taskgraph.TaskNode, placement *taskPlacement) {
+	if placement == nil {
+		return
+	}
+	if placement.cancelLeaseRenewal != nil {
+		placement.cancelLeaseRenewal()
+	}
+	if placement.instanceID != "" {
+		s.releaseInstance(placement.instanceID, placement.nodeID)
+	}
+	if s.ControlPlane != nil {
+		if err := s.ControlPlane.ReleaseTaskLease(ctx, placement.taskLease); err != nil {
+			slog.Warn("control plane task lease release failed",
+				"request_id", placement.taskLease.RequestID,
+				"task_id", placement.taskLease.TaskID,
+				"epoch", placement.taskLease.Epoch,
+				"error", err)
+		}
+	}
+}
+
+func (s *Scheduler) acquireProfilePlacement(ctx context.Context, profile string, instances []controlplane.AgentInstance) (controlplane.AgentInstance, controlplane.ProfileLease, error) {
+	if profile == "" {
+		return controlplane.AgentInstance{}, controlplane.ProfileLease{}, nil
+	}
+
+	lease, ok, err := s.ControlPlane.GetProfileLease(ctx, profile)
+	if err != nil {
+		return controlplane.AgentInstance{}, controlplane.ProfileLease{}, fmt.Errorf("get profile lease for %q: %w", profile, err)
+	}
+	if ok {
+		instance, found, err := findSchedulableInstanceByID(s.selectTaskInstance, ctx, &taskgraph.TaskNode{Agent: profile}, instances, lease.AssignedInstance)
+		if err != nil {
+			return controlplane.AgentInstance{}, controlplane.ProfileLease{}, fmt.Errorf("select leased instance for profile %q: %w", profile, err)
+		}
+		if !found {
+			return controlplane.AgentInstance{}, controlplane.ProfileLease{}, recoverableDispatchError{reason: fmt.Sprintf("profile %q is leased to unavailable instance %q", profile, lease.AssignedInstance)}
+		}
+		if lease.OwnerID != s.leaseOwnerID() {
+			return controlplane.AgentInstance{}, controlplane.ProfileLease{}, recoverableDispatchError{reason: fmt.Sprintf("profile %q is currently reserved by %q", profile, lease.OwnerID)}
+		}
+		renewed, err := s.ControlPlane.RenewProfileLease(ctx, lease, profileLeaseTTL)
+		if err != nil {
+			return controlplane.AgentInstance{}, controlplane.ProfileLease{}, recoverableDispatchError{reason: fmt.Sprintf("profile lease for %q could not be renewed: %v", profile, err)}
+		}
+		return instance, renewed, nil
+	}
+
+	instance, ok, err := s.selectTaskInstance(ctx, &taskgraph.TaskNode{Agent: profile}, instances)
+	if err != nil {
+		return controlplane.AgentInstance{}, controlplane.ProfileLease{}, fmt.Errorf("select instance for profile %q: %w", profile, err)
+	}
+	if !ok {
+		return controlplane.AgentInstance{}, controlplane.ProfileLease{}, nil
+	}
+
+	acquiredLease, acquired, err := s.ControlPlane.AcquireProfileLease(ctx, controlplane.ProfileLease{
+		Profile:          profile,
+		AssignedInstance: instance.ID,
+		ExecutionNode:    instance.NodeID,
+		OwnerID:          s.leaseOwnerID(),
+	}, profileLeaseTTL)
+	if err != nil {
+		return controlplane.AgentInstance{}, controlplane.ProfileLease{}, fmt.Errorf("acquire profile lease for %q: %w", profile, err)
+	}
+	if !acquired {
+		return controlplane.AgentInstance{}, controlplane.ProfileLease{}, recoverableDispatchError{reason: fmt.Sprintf("profile %q is currently reserved by %q", profile, acquiredLease.OwnerID)}
+	}
+	return instance, acquiredLease, nil
+}
+
+func (s *Scheduler) selectTaskInstance(ctx context.Context, task *taskgraph.TaskNode, instances []controlplane.AgentInstance) (controlplane.AgentInstance, bool, error) {
+	profile := ""
+	if task != nil {
+		profile = task.TargetProfile()
+	}
+	def := s.agentDefinition(profile)
+	nodes, err := s.instanceNodeMap(ctx, instances)
+	if err != nil {
+		return controlplane.AgentInstance{}, false, err
+	}
+
+	candidates := make([]controlplane.AgentInstance, 0, len(instances))
+	for _, instance := range instances {
+		if !isSchedulableInstanceState(instance.State) || instance.Endpoint.Address == "" {
+			continue
+		}
+		node, hasNode := nodes[instance.NodeID]
+		if !isEligibleNodeForAgent(def, node, hasNode) {
+			continue
+		}
+		if nodeAtCapacity(node, hasNode, s.nodeLoad(instance.NodeID)) {
+			continue
+		}
+		candidates = append(candidates, instance)
+	}
+	if len(candidates) == 0 {
+		return controlplane.AgentInstance{}, false, nil
+	}
+
+	if task != nil && task.AssignedInstance != "" {
+		for _, instance := range candidates {
+			if instance.ID == task.AssignedInstance {
+				return instance, true, nil
+			}
+		}
+	}
+
+	sort.Slice(candidates, func(i, j int) bool {
+		leftNode := nodes[candidates[i].NodeID]
+		rightNode := nodes[candidates[j].NodeID]
+		leftNodeLoad := s.nodeLoad(candidates[i].NodeID)
+		rightNodeLoad := s.nodeLoad(candidates[j].NodeID)
+		if leftNodeLoad != rightNodeLoad {
+			return leftNodeLoad < rightNodeLoad
+		}
+		leftInflight := s.instanceLoad(candidates[i].ID)
+		rightInflight := s.instanceLoad(candidates[j].ID)
+		if leftInflight != rightInflight {
+			return leftInflight < rightInflight
+		}
+		leftRequestUsage := s.requestNodeUsage(task, candidates[i].NodeID)
+		rightRequestUsage := s.requestNodeUsage(task, candidates[j].NodeID)
+		if leftRequestUsage != rightRequestUsage {
+			return leftRequestUsage < rightRequestUsage
+		}
+		leftNodeCapacity := effectiveNodeTaskCapacity(leftNode)
+		rightNodeCapacity := effectiveNodeTaskCapacity(rightNode)
+		if leftNodeCapacity != rightNodeCapacity {
+			return leftNodeCapacity > rightNodeCapacity
+		}
+		leftPriority := schedulableInstancePriority(candidates[i].State)
+		rightPriority := schedulableInstancePriority(candidates[j].State)
+		if leftPriority != rightPriority {
+			return leftPriority < rightPriority
+		}
+		if !candidates[i].LastHeartbeatAt.Equal(candidates[j].LastHeartbeatAt) {
+			return candidates[i].LastHeartbeatAt.After(candidates[j].LastHeartbeatAt)
+		}
+		return candidates[i].ID < candidates[j].ID
+	})
+
+	return candidates[0], true, nil
+}
+
+func findSchedulableInstanceByID(
+	selectFn func(context.Context, *taskgraph.TaskNode, []controlplane.AgentInstance) (controlplane.AgentInstance, bool, error),
+	ctx context.Context,
+	task *taskgraph.TaskNode,
+	instances []controlplane.AgentInstance,
+	instanceID string,
+) (controlplane.AgentInstance, bool, error) {
+	if strings.TrimSpace(instanceID) == "" {
+		return controlplane.AgentInstance{}, false, nil
+	}
+	taskCopy := &taskgraph.TaskNode{}
+	if task != nil {
+		*taskCopy = *task
+	}
+	taskCopy.AssignedInstance = instanceID
+	return selectFn(ctx, taskCopy, instances)
+}
+
+func (s *Scheduler) agentDefinition(profile string) runtime.AgentDefinition {
+	for _, def := range s.Agents {
+		if def.Name == profile {
+			return def
+		}
+	}
+	return runtime.AgentDefinition{}
+}
+
+func (s *Scheduler) instanceNodeMap(ctx context.Context, instances []controlplane.AgentInstance) (map[string]controlplane.Node, error) {
+	nodes := make(map[string]controlplane.Node)
+	if s.ControlPlane == nil {
+		return nodes, nil
+	}
+	nodeIDs := make(map[string]struct{})
+	for _, instance := range instances {
+		if instance.NodeID == "" {
+			continue
+		}
+		nodeIDs[instance.NodeID] = struct{}{}
+	}
+	if len(nodeIDs) == 0 {
+		return nodes, nil
+	}
+
+	lookupCtx := ctx
+	var cancel context.CancelFunc
+	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+		lookupCtx, cancel = context.WithTimeout(ctx, nodeLookupTimeout)
+		defer cancel()
+	}
+
+	registeredNodes, err := s.ControlPlane.ListNodes(lookupCtx)
+	if err != nil {
+		return nil, err
+	}
+	for _, node := range registeredNodes {
+		if _, exists := nodeIDs[node.ID]; !exists {
+			continue
+		}
+		nodes[node.ID] = node
+	}
+	return nodes, nil
+}
+
+func isEligibleNodeForAgent(def runtime.AgentDefinition, node controlplane.Node, hasNode bool) bool {
+	if hasNode && !isSchedulableNodeState(node.State) {
+		return false
+	}
+	if len(def.RequiredNodeLabels) == 0 {
+		return true
+	}
+	if !hasNode {
+		return false
+	}
+	for key, value := range def.RequiredNodeLabels {
+		if node.Labels[key] != value {
+			return false
+		}
+	}
+	return true
+}
+
+func isSchedulableNodeState(state controlplane.NodeState) bool {
+	switch state {
+	case controlplane.NodeStateReady, controlplane.NodeStateDegraded:
+		return true
+	default:
+		return false
+	}
+}
+
+func isRunningNodeState(state controlplane.NodeState) bool {
+	switch state {
+	case controlplane.NodeStateReady, controlplane.NodeStateDegraded, controlplane.NodeStateDraining:
+		return true
+	default:
+		return false
+	}
+}
+
+func nodeAtCapacity(node controlplane.Node, hasNode bool, currentLoad int) bool {
+	if !hasNode {
+		return false
+	}
+	if node.Capacity.MaxTasks <= 0 {
+		return false
+	}
+	return currentLoad >= node.Capacity.MaxTasks
+}
+
+func effectiveNodeTaskCapacity(node controlplane.Node) int {
+	if node.Capacity.MaxTasks <= 0 {
+		return 1 << 30
+	}
+	return node.Capacity.MaxTasks
+}
+
+func (s *Scheduler) prepareLoopAssignments(ctx context.Context, loopDef *loop.LoopDefinition) (map[string]controlplane.AgentInstance, *loopPlacement, controlplane.AgentInstance, bool, error) {
+	if s.ControlPlane == nil || loopDef == nil {
+		return nil, nil, controlplane.AgentInstance{}, false, nil
+	}
+
+	assignments := make(map[string]controlplane.AgentInstance)
+	leases := make([]controlplane.ProfileLease, 0, len(loopDef.States))
+	var firstInstance controlplane.AgentInstance
+	firstAgent := loopDef.AgentForState(loopDef.InitialState)
+	foundAny := false
+
+	for _, state := range loopDef.States {
+		if state.Agent == "" {
+			continue
+		}
+		if _, exists := assignments[state.Agent]; exists {
+			continue
+		}
+
+		instances, err := s.ControlPlane.ListInstances(ctx, controlplane.InstanceFilter{Profile: state.Agent})
+		if err != nil {
+			s.releaseLoopProfileLeases(context.WithoutCancel(ctx), leases)
+			return nil, nil, controlplane.AgentInstance{}, false, fmt.Errorf("list loop instances for profile %q: %w", state.Agent, err)
+		}
+		if len(instances) == 0 {
+			continue
+		}
+
+		instance, lease, err := s.acquireProfilePlacement(ctx, state.Agent, instances)
+		if err != nil {
+			s.releaseLoopProfileLeases(context.WithoutCancel(ctx), leases)
+			return nil, nil, controlplane.AgentInstance{}, false, err
+		}
+		if instance.ID == "" {
+			continue
+		}
+		assignments[state.Agent] = instance
+		leases = append(leases, lease)
+		foundAny = true
+		if state.Agent == firstAgent {
+			firstInstance = instance
+		}
+	}
+
+	if !foundAny {
+		return nil, nil, controlplane.AgentInstance{}, false, nil
+	}
+	if firstAgent != "" && firstInstance.ID == "" {
+		s.releaseLoopProfileLeases(context.WithoutCancel(ctx), leases)
+		return nil, nil, controlplane.AgentInstance{}, false, fmt.Errorf("no routable instance available for initial loop agent %q", firstAgent)
+	}
+	renewCtx, cancel := context.WithCancel(ctx)
+	for _, lease := range leases {
+		go s.runProfileLeaseHeartbeat(renewCtx, lease)
+	}
+	return assignments, &loopPlacement{leases: leases, cancelLeaseRenewal: cancel}, firstInstance, true, nil
+}
+
+func (s *Scheduler) finishLoopPlacement(ctx context.Context, placement *loopPlacement) {
+	if placement == nil {
+		return
+	}
+	if placement.cancelLeaseRenewal != nil {
+		placement.cancelLeaseRenewal()
+	}
+	s.releaseLoopProfileLeases(ctx, placement.leases)
+}
+
+func (s *Scheduler) releaseLoopProfileLeases(ctx context.Context, leases []controlplane.ProfileLease) {
+	for _, lease := range leases {
+		if err := s.ControlPlane.ReleaseProfileLease(ctx, lease); err != nil {
+			slog.Warn("control plane profile lease release failed",
+				"profile", lease.Profile,
+				"assigned_instance", lease.AssignedInstance,
+				"epoch", lease.Epoch,
+				"error", err)
+		}
+	}
+}
+
+func loopAssignedInstances(assignments map[string]controlplane.AgentInstance) map[string]string {
+	if len(assignments) == 0 {
+		return nil
+	}
+	result := make(map[string]string, len(assignments))
+	for profile, instance := range assignments {
+		if instance.ID != "" {
+			result[profile] = instance.ID
+		}
+	}
+	if len(result) == 0 {
+		return nil
+	}
+	return result
+}
+
+func loopExecutionNodes(assignments map[string]controlplane.AgentInstance) map[string]string {
+	if len(assignments) == 0 {
+		return nil
+	}
+	result := make(map[string]string, len(assignments))
+	for profile, instance := range assignments {
+		if instance.NodeID != "" {
+			result[profile] = instance.NodeID
+		}
+	}
+	if len(result) == 0 {
+		return nil
+	}
+	return result
+}
+
+func isSchedulableInstanceState(state controlplane.InstanceState) bool {
+	switch state {
+	case controlplane.InstanceStateReady, controlplane.InstanceStateBusy:
+		return true
+	default:
+		return false
+	}
+}
+
+func isRunningInstanceState(state controlplane.InstanceState) bool {
+	switch state {
+	case controlplane.InstanceStateReady, controlplane.InstanceStateBusy, controlplane.InstanceStateDraining:
+		return true
+	default:
+		return false
+	}
+}
+
+func schedulableInstancePriority(state controlplane.InstanceState) int {
+	switch state {
+	case controlplane.InstanceStateReady:
+		return 0
+	case controlplane.InstanceStateBusy:
+		return 1
+	default:
+		return 2
+	}
+}
+
+func (s *Scheduler) runPlacementLeaseHeartbeat(ctx context.Context, task *taskgraph.TaskNode, taskLease controlplane.TaskLease) {
+	ticker := time.NewTicker(taskLeaseRenewInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			renewedTask, err := s.ControlPlane.RenewTaskLease(ctx, taskLease, taskLeaseTTL)
+			if err != nil {
+				slog.Warn("control plane task lease renew failed",
+					"request_id", taskLease.RequestID,
+					"task_id", taskLease.TaskID,
+					"epoch", taskLease.Epoch,
+					"error", err)
+				return
+			}
+			taskLease = renewedTask
+			if task != nil {
+				task.LeaseEpoch = renewedTask.Epoch
+			}
+		}
+	}
+}
+
+func (s *Scheduler) runProfileLeaseHeartbeat(ctx context.Context, profileLease controlplane.ProfileLease) {
+	ticker := time.NewTicker(profileLeaseRenewInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			renewed, err := s.ControlPlane.RenewProfileLease(ctx, profileLease, profileLeaseTTL)
+			if err != nil {
+				slog.Warn("control plane profile lease renew failed",
+					"profile", profileLease.Profile,
+					"assigned_instance", profileLease.AssignedInstance,
+					"epoch", profileLease.Epoch,
+					"error", err)
+				return
+			}
+			profileLease = renewed
+		}
+	}
+}
+
+func (s *Scheduler) leaseOwnerID() string {
+	if strings.TrimSpace(s.LeaseOwnerID) != "" {
+		return s.LeaseOwnerID
+	}
+	return "conductor"
+}
+
+func (s *Scheduler) acquireInstance(instanceID, nodeID string) {
+	if instanceID == "" {
+		return
+	}
+	s.inflightMu.Lock()
+	defer s.inflightMu.Unlock()
+	if s.instanceInFlight == nil {
+		s.instanceInFlight = make(map[string]int)
+	}
+	s.instanceInFlight[instanceID]++
+	if nodeID != "" {
+		if s.nodeInFlight == nil {
+			s.nodeInFlight = make(map[string]int)
+		}
+		s.nodeInFlight[nodeID]++
+	}
+}
+
+func (s *Scheduler) releaseInstance(instanceID, nodeID string) {
+	if instanceID == "" {
+		return
+	}
+	s.inflightMu.Lock()
+	defer s.inflightMu.Unlock()
+	if s.instanceInFlight[instanceID] > 0 {
+		s.instanceInFlight[instanceID]--
+	}
+	if nodeID != "" && s.nodeInFlight[nodeID] > 0 {
+		s.nodeInFlight[nodeID]--
+	}
+}
+
+func (s *Scheduler) instanceLoad(instanceID string) int {
+	s.inflightMu.Lock()
+	defer s.inflightMu.Unlock()
+	return s.instanceInFlight[instanceID]
+}
+
+func (s *Scheduler) nodeLoad(nodeID string) int {
+	s.inflightMu.Lock()
+	defer s.inflightMu.Unlock()
+	return s.nodeInFlight[nodeID]
+}
+
+func (s *Scheduler) requestNodeUsage(task *taskgraph.TaskNode, nodeID string) int {
+	if s.graph == nil || nodeID == "" {
+		return 0
+	}
+	currentTaskID := ""
+	if task != nil {
+		currentTaskID = task.ID
+	}
+	usage := 0
+	for _, existing := range s.graph.Tasks {
+		if existing == nil || existing.ID == currentTaskID {
+			continue
+		}
+		if existing.ExecutionNode != nodeID {
+			continue
+		}
+		switch existing.Status {
+		case taskgraph.StatusFailed, taskgraph.StatusCancelled:
+			continue
+		default:
+			usage++
+		}
+	}
+	return usage
 }
 
 func (s *Scheduler) registerTaskCancel(taskID string, cancel context.CancelFunc) {
@@ -883,6 +1598,7 @@ func (s *Scheduler) Resume() {
 			if t.Status == taskgraph.StatusRunning {
 				t.Status = taskgraph.StatusPending
 				t.Result = ""
+				s.syncTaskState(context.Background(), t)
 			}
 		}
 	}
@@ -900,6 +1616,7 @@ func (s *Scheduler) Cancel() {
 			if t.Status == taskgraph.StatusPending || t.Status == taskgraph.StatusRunning {
 				t.Status = taskgraph.StatusCancelled
 				t.Result = "cancelled by user"
+				s.syncTaskState(context.Background(), t)
 			}
 		}
 	}
@@ -930,11 +1647,12 @@ func (s *Scheduler) AmendTask(taskID, newDesc, chatContext string) error {
 	task.Result = ""
 	task.ArtifactURI = ""
 	task.ArtifactFiles = nil
+	s.syncTaskState(context.Background(), task)
 	s.CancelTask(taskID)
 	s.Events.Emit(event.Event{
 		Type:          event.TaskAmended,
 		AmendedTaskID: taskID,
-		AmendedAgent:  task.Agent,
+		AmendedAgent:  task.TargetProfile(),
 	})
 	return nil
 }
@@ -973,6 +1691,9 @@ func (s *Scheduler) waitForResult(ctx context.Context, task *taskgraph.TaskNode,
 		timerC = timer.C
 		defer timer.Stop()
 	}
+	healthTicker := time.NewTicker(taskHealthCheckInterval)
+	defer healthTicker.Stop()
+	lastProgressAt := time.Now()
 
 	for {
 		select {
@@ -980,6 +1701,14 @@ func (s *Scheduler) waitForResult(ctx context.Context, task *taskgraph.TaskNode,
 			return nil, ctx.Err()
 		case <-timerC:
 			return nil, fmt.Errorf("task %q timed out", task.ID)
+		case <-healthTicker.C:
+			if err := s.checkTaskExecutionHealth(ctx, task); err != nil {
+				return nil, err
+			}
+			if time.Since(lastProgressAt) >= taskProgressHeartbeat {
+				s.emitTaskHeartbeat(task)
+				lastProgressAt = time.Now()
+			}
 		case msg, ok := <-ch:
 			if !ok {
 				return nil, fmt.Errorf("channel closed while waiting for task %q", task.ID)
@@ -1000,6 +1729,7 @@ func (s *Scheduler) waitForResult(ctx context.Context, task *taskgraph.TaskNode,
 				if err := s.forwardUserQuery(ctx, msg); err != nil {
 					return nil, err
 				}
+				lastProgressAt = time.Now()
 				if timer != nil {
 					timer.Reset(timeout)
 				}
@@ -1015,6 +1745,7 @@ func (s *Scheduler) waitForResult(ctx context.Context, task *taskgraph.TaskNode,
 			}
 			// Heartbeat: any other message type (status update, review response
 			// being forwarded, etc.) resets the timeout — the agent is alive.
+			lastProgressAt = time.Now()
 			if timer != nil {
 				timer.Reset(timeout)
 			}
@@ -1147,7 +1878,7 @@ func buildPipelineContext(task *taskgraph.TaskNode, graph *taskgraph.TaskGraph, 
 			marker = " [YOU]"
 		}
 
-		line := fmt.Sprintf("- %s (%s)%s: %q", t.ID, t.Agent, marker, t.Description)
+		line := fmt.Sprintf("- %s (%s)%s: %q", t.ID, t.TargetProfile(), marker, t.Description)
 
 		if ds := downstream[t.ID]; len(ds) > 0 {
 			line += " → feeds into: " + strings.Join(ds, ", ")
@@ -1242,18 +1973,35 @@ func (s *Scheduler) dispatchLoopTask(ctx context.Context, task *taskgraph.TaskNo
 
 	// Build LoopContext for the initial dispatch.
 	depParts := s.buildDepPartsData(task, graph)
+	assignments, loopPlacement, firstInstance, ok, err := s.prepareLoopAssignments(ctx, loopDef)
+	if err != nil {
+		if isRecoverableDispatchError(err) {
+			s.prepareTaskForRedispatch(ctx, task)
+		}
+		return err
+	}
+	if loopPlacement != nil {
+		defer s.finishLoopPlacement(context.WithoutCancel(ctx), loopPlacement)
+	}
+	if ok {
+		task.AssignedInstance = firstInstance.ID
+		task.ExecutionNode = firstInstance.NodeID
+		task.LeaseEpoch = 0
+	}
 	lc := &loop.LoopContext{
 		Definition: *loopDef,
 		State: loop.LoopState{
 			LoopID:       loopDef.ID,
 			CurrentState: loopDef.InitialState,
 		},
-		TaskID:        task.ID,
-		Conductor:     "conductor",
-		OriginalTask:  task.Description,
-		UserRequest:   s.UserRequest,
-		DepParts:      depParts,
-		DispatchNonce: nonce,
+		TaskID:            task.ID,
+		Conductor:         "conductor",
+		OriginalTask:      task.Description,
+		UserRequest:       s.UserRequest,
+		DepParts:          depParts,
+		AssignedInstances: loopAssignedInstances(assignments),
+		ExecutionNodes:    loopExecutionNodes(assignments),
+		DispatchNonce:     nonce,
 	}
 
 	// Build decision context for review enforcement across the loop.
@@ -1310,6 +2058,12 @@ func (s *Scheduler) dispatchLoopTask(ctx context.Context, task *taskgraph.TaskNo
 		},
 		Timestamp: time.Now(),
 	}
+	if assigned := lc.AssignedInstances[firstAgent]; assigned != "" {
+		msg.Metadata["assigned_instance"] = assigned
+	}
+	if executionNode := lc.ExecutionNodes[firstAgent]; executionNode != "" {
+		msg.Metadata["execution_node"] = executionNode
+	}
 
 	if s.Logger != nil {
 		s.Logger.Log(ctx, msg)
@@ -1344,6 +2098,9 @@ func (s *Scheduler) waitForLoopCompletion(ctx context.Context, task *taskgraph.T
 		timerC = timer.C
 		defer timer.Stop()
 	}
+	healthTicker := time.NewTicker(taskHealthCheckInterval)
+	defer healthTicker.Stop()
+	lastProgressAt := time.Now()
 
 	for {
 		select {
@@ -1351,14 +2108,32 @@ func (s *Scheduler) waitForLoopCompletion(ctx context.Context, task *taskgraph.T
 			return ctx.Err()
 		case <-timerC:
 			return fmt.Errorf("loop task %q timed out", task.ID)
+		case <-healthTicker.C:
+			if err := s.checkTaskExecutionHealth(ctx, task); err != nil {
+				s.prepareTaskForRedispatch(ctx, task)
+				return err
+			}
+			if time.Since(lastProgressAt) >= taskProgressHeartbeat {
+				s.emitTaskHeartbeat(task)
+				lastProgressAt = time.Now()
+			}
 		case msg, ok := <-ch:
 			if !ok {
 				return fmt.Errorf("channel closed while waiting for loop completion")
+			}
+			if msg.Type == message.TypeStatusUpdate {
+				s.updateLoopTaskExecution(task, msg)
+				lastProgressAt = time.Now()
+				if timer != nil {
+					timer.Reset(timeout)
+				}
+				continue
 			}
 			if msg.Type == message.TypeUserQuery {
 				if err := s.forwardUserQuery(ctx, msg); err != nil {
 					return err
 				}
+				lastProgressAt = time.Now()
 				if timer != nil {
 					timer.Reset(timeout)
 				}
@@ -1381,16 +2156,153 @@ func (s *Scheduler) waitForLoopCompletion(ctx context.Context, task *taskgraph.T
 				task.ArtifactFiles = extractArtifactFiles(msg)
 				s.recordRemoteUsage(ctx, msg)
 
-				if msg.Metadata != nil && msg.Metadata["loop_escalated"] == "true" {
+				if msg.Metadata != nil && msg.Metadata["status"] == "failed" {
+					task.Status = taskgraph.StatusFailed
+				} else if msg.Metadata != nil && msg.Metadata["loop_escalated"] == "true" {
 					task.Status = taskgraph.StatusEscalated
 				} else {
 					task.Status = taskgraph.StatusCompleted
 				}
+				s.syncTaskState(ctx, task)
 				return nil
 			}
 			// Ignore non-terminal messages (agents route among themselves).
 		}
 	}
+}
+
+func (s *Scheduler) emitTaskHeartbeat(task *taskgraph.TaskNode) {
+	if s.Events == nil || task == nil {
+		return
+	}
+	progress := "Still working..."
+	if task.AssignedInstance != "" && task.ExecutionNode != "" {
+		progress = fmt.Sprintf("Still working on %s via %s", task.AssignedInstance, task.ExecutionNode)
+	} else if task.AssignedInstance != "" {
+		progress = fmt.Sprintf("Still working on %s", task.AssignedInstance)
+	} else if task.ExecutionNode != "" {
+		progress = fmt.Sprintf("Still working on node %s", task.ExecutionNode)
+	}
+	s.Events.Emit(event.Event{
+		Type:          event.TaskProgress,
+		TaskID:        task.ID,
+		TaskAgent:     task.TargetProfile(),
+		ExecutionNode: task.ExecutionNode,
+		ProgressText:  progress,
+	})
+}
+
+func (s *Scheduler) syncGraphState(ctx context.Context, graph *taskgraph.TaskGraph) {
+	if s.ControlPlane == nil || graph == nil {
+		return
+	}
+	for _, task := range graph.Tasks {
+		s.syncTaskState(ctx, task)
+	}
+}
+
+func (s *Scheduler) syncTaskState(ctx context.Context, task *taskgraph.TaskNode) {
+	if s.ControlPlane == nil || task == nil || s.RequestID == "" {
+		return
+	}
+
+	record := controlplane.TaskRecord{
+		RequestID:        s.RequestID,
+		TaskID:           task.ID,
+		Profile:          task.TargetProfile(),
+		AssignedInstance: task.AssignedInstance,
+		ExecutionNode:    task.ExecutionNode,
+		Status:           string(task.Status),
+		LeaseEpoch:       task.LeaseEpoch,
+	}
+	if err := s.ControlPlane.UpsertTask(ctx, record); err != nil {
+		slog.Warn("control plane task upsert failed",
+			"request_id", s.RequestID,
+			"task_id", task.ID,
+			"error", err)
+	}
+}
+
+func (s *Scheduler) updateLoopTaskExecution(task *taskgraph.TaskNode, msg *message.Message) {
+	if task == nil || msg == nil || msg.Metadata == nil {
+		return
+	}
+	if msg.Metadata["task_id"] != task.ID || msg.Metadata["loop_id"] == "" {
+		return
+	}
+
+	updated := false
+	if assigned := strings.TrimSpace(msg.Metadata["assigned_instance"]); assigned != "" && assigned != task.AssignedInstance {
+		task.AssignedInstance = assigned
+		updated = true
+	}
+	if executionNode := strings.TrimSpace(msg.Metadata["execution_node"]); executionNode != "" && executionNode != task.ExecutionNode {
+		task.ExecutionNode = executionNode
+		updated = true
+	}
+	if updated {
+		s.syncTaskState(context.Background(), task)
+	}
+}
+
+func (s *Scheduler) prepareTaskForRedispatch(ctx context.Context, task *taskgraph.TaskNode) {
+	if task == nil {
+		return
+	}
+	task.Status = taskgraph.StatusPending
+	task.Result = ""
+	task.ArtifactURI = ""
+	task.ArtifactFiles = nil
+	task.AssignedInstance = ""
+	task.ExecutionNode = ""
+	task.LeaseEpoch = 0
+	s.syncTaskState(ctx, task)
+}
+
+func (s *Scheduler) checkTaskExecutionHealth(ctx context.Context, task *taskgraph.TaskNode) error {
+	if s.ControlPlane == nil || task == nil {
+		return nil
+	}
+
+	if task.ExecutionNode != "" {
+		node, ok, err := s.ControlPlane.GetNode(ctx, task.ExecutionNode)
+		if err == nil {
+			if !ok {
+				return recoverableDispatchError{reason: fmt.Sprintf("execution node %q disappeared", task.ExecutionNode)}
+			}
+			if !isRunningNodeState(node.State) {
+				return recoverableDispatchError{reason: fmt.Sprintf("execution node %q became unavailable", task.ExecutionNode)}
+			}
+		}
+	}
+
+	if task.AssignedInstance != "" {
+		instance, ok, err := s.ControlPlane.GetInstance(ctx, task.AssignedInstance)
+		if err == nil {
+			if !ok {
+				return recoverableDispatchError{reason: fmt.Sprintf("assigned instance %q disappeared", task.AssignedInstance)}
+			}
+			if !isRunningInstanceState(instance.State) || instance.Endpoint.Address == "" {
+				return recoverableDispatchError{reason: fmt.Sprintf("assigned instance %q became unavailable", task.AssignedInstance)}
+			}
+		}
+	}
+
+	if task.LeaseEpoch == 0 {
+		return nil
+	}
+
+	lease, ok, err := s.ControlPlane.GetTaskLease(ctx, s.RequestID, task.ID)
+	if err != nil {
+		return nil
+	}
+	if !ok {
+		return recoverableDispatchError{reason: fmt.Sprintf("task lease for %q expired", task.ID)}
+	}
+	if lease.OwnerID != s.leaseOwnerID() || lease.Epoch != task.LeaseEpoch {
+		return recoverableDispatchError{reason: fmt.Sprintf("task lease for %q moved to a different owner", task.ID)}
+	}
+	return nil
 }
 
 // buildDepPartsData builds dependency context as raw maps (for LoopContext serialization).
@@ -1403,7 +2315,7 @@ func (s *Scheduler) buildDepPartsData(task *taskgraph.TaskNode, graph *taskgraph
 		}
 		data := map[string]any{
 			"dependency_id":    dep.ID,
-			"dependency_agent": dep.Agent,
+			"dependency_agent": dep.TargetProfile(),
 		}
 		if dep.ArtifactURI != "" {
 			data["artifact_uri"] = dep.ArtifactURI
@@ -1437,6 +2349,7 @@ func (s *Scheduler) buildKnowledgeContext(task *taskgraph.TaskNode) []message.Pa
 	sharedGraph := s.KnowledgeGraph
 	agentGraphs := s.AgentGraphs
 	s.knowledgeMu.RUnlock()
+	profile := taskProfile(task)
 
 	sharedCount := 0
 	if sharedGraph != nil {
@@ -1444,32 +2357,32 @@ func (s *Scheduler) buildKnowledgeContext(task *taskgraph.TaskNode) []message.Pa
 	}
 	agentCount := 0
 	if agentGraphs != nil {
-		if ag := agentGraphs[task.Agent]; ag != nil {
+		if ag := agentGraphs[profile]; ag != nil {
 			agentCount = len(ag.Nodes)
 		}
 	}
-	slog.Debug("buildKnowledgeContext", "agent", task.Agent, "task", task.ID,
+	slog.Debug("buildKnowledgeContext", "agent", profile, "task", task.ID,
 		"shared_nodes", sharedCount, "agent_nodes", agentCount)
 
 	if sharedGraph == nil || len(sharedGraph.Nodes) == 0 {
 		// Even without a shared graph, check agent graph.
 		if agentGraphs == nil {
-			slog.Debug("no knowledge graphs available", "agent", task.Agent)
+			slog.Debug("no knowledge graphs available", "agent", profile)
 			return nil
 		}
-		ag := agentGraphs[task.Agent]
+		ag := agentGraphs[profile]
 		if ag == nil || len(ag.Nodes) == 0 {
-			slog.Debug("no knowledge nodes for agent", "agent", task.Agent)
+			slog.Debug("no knowledge nodes for agent", "agent", profile)
 			return nil
 		}
 	}
 
 	var result knowledge.LookupResult
 	if agentGraphs != nil {
-		agentGraph := agentGraphs[task.Agent]
-		result = knowledge.LookupDual(agentGraph, sharedGraph, task.Agent, task.Description, knowledge.LookupOpts{})
+		agentGraph := agentGraphs[profile]
+		result = knowledge.LookupDual(agentGraph, sharedGraph, profile, task.Description, knowledge.LookupOpts{})
 	} else {
-		result = knowledge.Lookup(sharedGraph, task.Agent, task.Description, knowledge.LookupOpts{})
+		result = knowledge.Lookup(sharedGraph, profile, task.Description, knowledge.LookupOpts{})
 	}
 	// Inject decision-tagged nodes unconditionally — regardless of keyword overlap.
 	// This ensures project-wide decisions (e.g., "use Material Design 3") propagate
@@ -1511,21 +2424,21 @@ func (s *Scheduler) buildKnowledgeContext(task *taskgraph.TaskNode) []message.Pa
 		}
 	}
 
-	slog.Debug("knowledge lookup result", "agent", task.Agent, "own", len(result.Own), "related", len(result.Related))
+	slog.Debug("knowledge lookup result", "agent", profile, "own", len(result.Own), "related", len(result.Related))
 
 	// Emit KnowledgeLookup event for CLI visualization.
 	if s.Events != nil && (len(result.Own) > 0 || len(result.Related) > 0) {
 		var ownInfos []event.KnowledgeNodeInfo
 		for _, n := range result.Own {
 			ownInfos = append(ownInfos, event.KnowledgeNodeInfo{
-				ID: n.ID, Agent: n.Agent, Title: n.Title,
+				ID: n.ID, Agent: n.Agent, Title: n.Title, Summary: n.Summary, Tags: append([]string(nil), n.Tags...),
 			})
 		}
 		var relInfos []event.KnowledgeRelInfo
 		for _, rn := range result.Related {
 			relInfos = append(relInfos, event.KnowledgeRelInfo{
 				KnowledgeNodeInfo: event.KnowledgeNodeInfo{
-					ID: rn.ID, Agent: rn.Agent, Title: rn.Title,
+					ID: rn.ID, Agent: rn.Agent, Title: rn.Title, Summary: rn.Summary, Tags: append([]string(nil), rn.Tags...),
 				},
 				Depth:     rn.Depth,
 				Relations: rn.Relations,
@@ -1554,15 +2467,15 @@ func (s *Scheduler) buildKnowledgeContext(task *taskgraph.TaskNode) []message.Pa
 		}
 		collectEdges(sharedGraph)
 		if agentGraphs != nil {
-			collectEdges(agentGraphs[task.Agent])
+			collectEdges(agentGraphs[profile])
 		}
 		s.Events.Emit(event.Event{
-			Type:                 event.KnowledgeLookup,
-			KnowledgeLookupAgent: task.Agent,
-			KnowledgeLookupTask:  task.ID,
+			Type:                    event.KnowledgeLookup,
+			KnowledgeLookupAgent:    profile,
+			KnowledgeLookupTask:     task.ID,
 			KnowledgeLookupOwnNodes: ownInfos,
 			KnowledgeLookupRelNodes: relInfos,
-			KnowledgeLookupEdges: edgeInfos,
+			KnowledgeLookupEdges:    edgeInfos,
 		})
 	}
 
@@ -1634,7 +2547,8 @@ func (s *Scheduler) scheduleKnowledgeRefresh(ctx context.Context, graph *taskgra
 	// Copy task content to decouple from scheduler mutations.
 	tcopy := &taskgraph.TaskNode{
 		ID:          task.ID,
-		Agent:       task.Agent,
+		Agent:       task.TargetProfile(),
+		Profile:     task.TargetProfile(),
 		Description: task.Description,
 		Result:      task.Result,
 		Status:      taskgraph.StatusCompleted,
@@ -1654,11 +2568,7 @@ func (s *Scheduler) scheduleKnowledgeRefresh(ctx context.Context, graph *taskgra
 func (s *Scheduler) refreshKnowledgeFromTask(ctx context.Context, requestName string, task *taskgraph.TaskNode) error {
 	s.knowledgeRefreshMu.Lock()
 	defer s.knowledgeRefreshMu.Unlock()
-
-	baseDir := s.baseDir()
-	if baseDir == "" {
-		return fmt.Errorf("cannot resolve storage base dir")
-	}
+	profile := taskProfile(task)
 
 	sharedStorage := s.StorageFactory("conductor")
 	sharedGraph, err := knowledge.Load(ctx, sharedStorage)
@@ -1684,7 +2594,7 @@ func (s *Scheduler) refreshKnowledgeFromTask(ctx context.Context, requestName st
 	}
 
 	pruneOpts := knowledge.PruneOpts{}
-	if max := s.maxKnowledgeNodes(task.Agent); max > 0 {
+	if max := s.maxKnowledgeNodes(profile); max > 0 {
 		pruneOpts.MaxNodes = max
 	}
 
@@ -1697,7 +2607,7 @@ func (s *Scheduler) refreshKnowledgeFromTask(ctx context.Context, requestName st
 
 	// Rehydrate scheduler memory so subsequent dispatches see fresh knowledge.
 	updatedShared, _ := knowledge.Load(ctx, sharedStorage)
-	updatedAgent, _ := knowledge.LoadFromTier(ctx, s.StorageFactory(task.Agent), runtime.TierAgent)
+	updatedAgent, _ := knowledge.LoadFromTier(ctx, s.StorageFactory(profile), runtime.TierAgent)
 	if updatedShared != nil {
 		s.knowledgeMu.Lock()
 		s.KnowledgeGraph = updatedShared
@@ -1705,24 +2615,17 @@ func (s *Scheduler) refreshKnowledgeFromTask(ctx context.Context, requestName st
 			s.AgentGraphs = make(map[string]*knowledge.Graph)
 		}
 		if updatedAgent != nil {
-			s.AgentGraphs[task.Agent] = updatedAgent
+			s.AgentGraphs[profile] = updatedAgent
 		}
 		s.knowledgeMu.Unlock()
 	}
 
 	slog.Info("incremental knowledge refreshed",
 		"task", task.ID,
-		"agent", task.Agent,
+		"agent", profile,
 		"nodes", len(manifest.Nodes),
 		"edges", len(manifest.Edges))
 	return nil
-}
-
-func (s *Scheduler) baseDir() string {
-	if s.Storage == nil {
-		return ""
-	}
-	return filepath.Dir(s.Storage.SharedDir())
 }
 
 func (s *Scheduler) maxKnowledgeNodes(agent string) int {
@@ -1745,7 +2648,7 @@ func (s *Scheduler) resolveTaskTimeout(task *taskgraph.TaskNode) time.Duration {
 
 	// Check agent-level config.
 	for _, def := range s.Agents {
-		if def.Name == task.Agent {
+		if def.Name == taskProfile(task) {
 			return def.TaskTimeout // 0 = no timeout
 		}
 	}
@@ -1925,10 +2828,6 @@ func taskResultSummary(result string, maxLen int) string {
 // persistHitCounters saves all modified agent knowledge graphs so that
 // in-memory hit counters (Hits, LastHitAt) survive across requests.
 func (s *Scheduler) persistHitCounters(ctx context.Context) {
-	baseDir := s.baseDir()
-	if baseDir == "" {
-		return
-	}
 	s.knowledgeMu.RLock()
 	graphs := s.AgentGraphs
 	s.knowledgeMu.RUnlock()

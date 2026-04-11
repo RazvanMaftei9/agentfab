@@ -23,7 +23,11 @@ func TestRenderStartupTTY(t *testing.T) {
 		bus.Emit(event.Event{Type: event.AllAgentsReady})
 	}()
 
-	r.RenderStartup(bus, "my-project", 2)
+	r.RenderStartup(bus, "my-project", 2, StartupSummary{
+		RuntimeMode:         "External-Node Distributed",
+		ControlPlaneAddress: "127.0.0.1:50051",
+		BootstrapNodeIDs:    []string{"node-1"},
+	})
 	out := buf.String()
 
 	if !strings.Contains(out, "agentfab") {
@@ -41,35 +45,17 @@ func TestRenderStartupTTY(t *testing.T) {
 	if !strings.Contains(out, "developer") {
 		t.Error("expected developer agent")
 	}
+	if !strings.Contains(out, "External-Node Distributed") {
+		t.Error("expected runtime mode")
+	}
+	if !strings.Contains(out, "127.0.0.1:50051") {
+		t.Error("expected control-plane address")
+	}
+	if !strings.Contains(out, "node-1") {
+		t.Error("expected local bootstrap node id")
+	}
 	if !strings.Contains(out, "2 agents ready.") {
 		t.Error("expected agent count in ready message")
-	}
-}
-
-func TestRenderStartupNonTTY(t *testing.T) {
-	var buf bytes.Buffer
-	r := NewRenderer(&buf, false)
-
-	bus := event.NewBus()
-	go func() {
-		bus.Emit(event.Event{Type: event.AgentReady, AgentName: "dev", AgentModel: "openai/gpt-4"})
-		bus.Emit(event.Event{Type: event.AllAgentsReady})
-	}()
-
-	r.RenderStartup(bus, "test", 1)
-	out := buf.String()
-
-	if strings.Contains(out, "\033[") {
-		t.Error("non-TTY output should not contain ANSI codes")
-	}
-	if !strings.Contains(out, "OK dev") {
-		t.Error("expected OK prefix for agent")
-	}
-	if !strings.Contains(out, "agentfab v0.1.0 -- test") {
-		t.Error("expected plain header")
-	}
-	if !strings.Contains(out, "1 agents ready.") {
-		t.Error("expected agent count")
 	}
 }
 
@@ -90,7 +76,7 @@ func TestRenderRequestLifecycle(t *testing.T) {
 			OutputTokens: 300,
 			TotalCalls:   1,
 		})
-		bus.Emit(event.Event{Type: event.TaskStart, TaskID: "t1"})
+		bus.Emit(event.Event{Type: event.TaskStart, TaskID: "t1", ExecutionNode: "node-1"})
 		bus.Emit(event.Event{
 			Type:              event.TaskComplete,
 			TaskID:            "t1",
@@ -131,6 +117,9 @@ func TestRenderRequestLifecycle(t *testing.T) {
 	}
 	if !strings.Contains(out, "t1") {
 		t.Error("expected task t1 in output")
+	}
+	if !strings.Contains(out, "planner@node-1") {
+		t.Error("expected execution node in task output")
 	}
 	if !strings.Contains(out, "Done") {
 		t.Error("expected Done summary")
@@ -200,7 +189,7 @@ func TestRenderStartupClosedBus(t *testing.T) {
 	bus.Close()
 
 	// Should not hang — range over closed channel exits.
-	r.RenderStartup(bus, "test", 0)
+	r.RenderStartup(bus, "test", 0, StartupSummary{})
 }
 
 func TestRenderRequestShowsTokens(t *testing.T) {
@@ -363,6 +352,42 @@ func TestRenderRequestTTYClearsStaleGraphFrames(t *testing.T) {
 	}
 }
 
+func TestRenderRequestTTYUpdatesExecutionNodeFromTaskProgress(t *testing.T) {
+	var buf bytes.Buffer
+	r := NewRenderer(&buf, true)
+
+	bus := event.NewBus()
+	go func() {
+		bus.Emit(event.Event{
+			Type: event.DecomposeEnd,
+			Tasks: []event.TaskSummary{
+				{ID: "t1", Agent: "designer", Status: "pending"},
+			},
+		})
+		bus.Emit(event.Event{
+			Type:            event.TaskStart,
+			TaskID:          "t1",
+			TaskAgent:       "designer",
+			TaskDescription: "Create the UI",
+		})
+		bus.Emit(event.Event{
+			Type:          event.TaskProgress,
+			TaskID:        "t1",
+			TaskAgent:     "designer",
+			ExecutionNode: "node-2",
+			ProgressText:  "Running on node-2/designer via node-2",
+		})
+		bus.Emit(event.Event{Type: event.RequestComplete})
+	}()
+
+	r.RenderRequest(bus)
+	screen := emulateTerminalScreen(buf.String())
+
+	if !strings.Contains(screen, "designer@node-2") {
+		t.Fatalf("expected execution node label in graph:\n%s", screen)
+	}
+}
+
 func TestRenderRequestTTYClearsGraphAfterKnowledgeLookup(t *testing.T) {
 	var buf bytes.Buffer
 	r := NewRenderer(&buf, true)
@@ -424,8 +449,152 @@ func TestRenderRequestTTYClearsGraphAfterKnowledgeLookup(t *testing.T) {
 	if strings.Contains(screen, "architect working...") && strings.Contains(screen, "✓ t1") {
 		t.Fatalf("completed task still appears as running in final screen:\n%s", screen)
 	}
-	if !strings.Contains(screen, "designer reading 1 knowledge nodes") {
+	if !strings.Contains(screen, "designer using 1 knowledge nodes") {
 		t.Fatalf("expected knowledge lookup output in final screen:\n%s", screen)
+	}
+}
+
+func TestRenderRequestTTYDeduplicatesRepeatedKnowledgeLookup(t *testing.T) {
+	var buf bytes.Buffer
+	r := NewRenderer(&buf, true)
+
+	bus := event.NewBus()
+	go func() {
+		bus.Emit(event.Event{
+			Type: event.DecomposeEnd,
+			Tasks: []event.TaskSummary{
+				{ID: "t1", Agent: "developer", Status: "pending"},
+			},
+		})
+		bus.Emit(event.Event{
+			Type:            event.TaskStart,
+			TaskID:          "t1",
+			TaskAgent:       "developer",
+			TaskDescription: "Implement the browser DAW MVP",
+		})
+		lookup := event.Event{
+			Type:                 event.KnowledgeLookup,
+			KnowledgeLookupAgent: "developer",
+			KnowledgeLookupTask:  "t1",
+			KnowledgeLookupOwnNodes: []event.KnowledgeNodeInfo{
+				{ID: "dev/a", Agent: "developer", Title: "Browser DAW MVP Architecture", Summary: "Architecture decisions for the MVP."},
+			},
+		}
+		bus.Emit(lookup)
+		bus.Emit(lookup)
+		bus.Emit(event.Event{Type: event.RequestComplete})
+	}()
+
+	r.RenderRequest(bus)
+	screen := emulateTerminalScreen(buf.String())
+
+	if count := strings.Count(screen, "developer using 1 knowledge nodes"); count != 1 {
+		t.Fatalf("expected exactly one knowledge lookup block, got %d:\n%s", count, screen)
+	}
+}
+
+func TestRenderRequestTTYIgnoresKnowledgeLookupChangesOutsideVisiblePanel(t *testing.T) {
+	var buf bytes.Buffer
+	r := NewRenderer(&buf, true)
+
+	bus := event.NewBus()
+	go func() {
+		bus.Emit(event.Event{
+			Type: event.DecomposeEnd,
+			Tasks: []event.TaskSummary{
+				{ID: "t1", Agent: "developer", Status: "pending"},
+			},
+		})
+		bus.Emit(event.Event{
+			Type:            event.TaskStart,
+			TaskID:          "t1",
+			TaskAgent:       "developer",
+			TaskDescription: "Implement the browser DAW MVP",
+		})
+
+		first := event.Event{
+			Type:                 event.KnowledgeLookup,
+			KnowledgeLookupAgent: "developer",
+			KnowledgeLookupTask:  "t1",
+			KnowledgeLookupOwnNodes: []event.KnowledgeNodeInfo{
+				{ID: "designer/design-system", Agent: "designer", Title: "Browser DAW Design System", Tags: []string{"decision"}},
+				{ID: "developer/request", Agent: "developer", Title: "Implement the browser-based DAW MVP", Tags: []string{"user-request"}},
+			},
+			KnowledgeLookupRelNodes: []event.KnowledgeRelInfo{
+				{KnowledgeNodeInfo: event.KnowledgeNodeInfo{ID: "architect/a1", Agent: "architect", Title: "Architecture Alpha"}, Depth: 2},
+				{KnowledgeNodeInfo: event.KnowledgeNodeInfo{ID: "architect/a2", Agent: "architect", Title: "Architecture Beta"}, Depth: 2},
+				{KnowledgeNodeInfo: event.KnowledgeNodeInfo{ID: "architect/a3", Agent: "architect", Title: "Architecture Gamma"}, Depth: 2},
+				{KnowledgeNodeInfo: event.KnowledgeNodeInfo{ID: "architect/a4", Agent: "architect", Title: "Architecture Delta"}, Depth: 2},
+				{KnowledgeNodeInfo: event.KnowledgeNodeInfo{ID: "architect/a5", Agent: "architect", Title: "Architecture Epsilon"}, Depth: 2},
+				{KnowledgeNodeInfo: event.KnowledgeNodeInfo{ID: "architect/a6", Agent: "architect", Title: "Architecture Zeta"}, Depth: 2},
+			},
+		}
+		second := first
+		second.KnowledgeLookupRelNodes = []event.KnowledgeRelInfo{
+			{KnowledgeNodeInfo: event.KnowledgeNodeInfo{ID: "architect/a1", Agent: "architect", Title: "Architecture Alpha"}, Depth: 2},
+			{KnowledgeNodeInfo: event.KnowledgeNodeInfo{ID: "architect/a2", Agent: "architect", Title: "Architecture Beta"}, Depth: 2},
+			{KnowledgeNodeInfo: event.KnowledgeNodeInfo{ID: "architect/a3", Agent: "architect", Title: "Architecture Gamma"}, Depth: 2},
+			{KnowledgeNodeInfo: event.KnowledgeNodeInfo{ID: "architect/z1", Agent: "architect", Title: "Z Hidden One"}, Depth: 2},
+			{KnowledgeNodeInfo: event.KnowledgeNodeInfo{ID: "architect/z2", Agent: "architect", Title: "Z Hidden Two"}, Depth: 2},
+			{KnowledgeNodeInfo: event.KnowledgeNodeInfo{ID: "architect/z3", Agent: "architect", Title: "Z Hidden Three"}, Depth: 2},
+		}
+
+		bus.Emit(first)
+		bus.Emit(second)
+		bus.Emit(event.Event{Type: event.RequestComplete})
+	}()
+
+	r.RenderRequest(bus)
+	screen := emulateTerminalScreen(buf.String())
+
+	if count := strings.Count(screen, "developer using 8 knowledge nodes"); count != 1 {
+		t.Fatalf("expected exactly one visible knowledge panel, got %d:\n%s", count, screen)
+	}
+}
+
+func TestRenderRequestTTYShowsKnowledgeOncePerTask(t *testing.T) {
+	var buf bytes.Buffer
+	r := NewRenderer(&buf, true)
+
+	bus := event.NewBus()
+	go func() {
+		bus.Emit(event.Event{
+			Type: event.DecomposeEnd,
+			Tasks: []event.TaskSummary{
+				{ID: "t1", Agent: "developer", Status: "pending"},
+			},
+		})
+		bus.Emit(event.Event{
+			Type:            event.TaskStart,
+			TaskID:          "t1",
+			TaskAgent:       "developer",
+			TaskDescription: "Implement the browser DAW MVP",
+		})
+		bus.Emit(event.Event{
+			Type:                 event.KnowledgeLookup,
+			KnowledgeLookupAgent: "developer",
+			KnowledgeLookupTask:  "t1",
+			KnowledgeLookupOwnNodes: []event.KnowledgeNodeInfo{
+				{ID: "dev/a", Agent: "developer", Title: "Architecture Alpha"},
+			},
+		})
+		bus.Emit(event.Event{
+			Type:                 event.KnowledgeLookup,
+			KnowledgeLookupAgent: "developer",
+			KnowledgeLookupTask:  "t1",
+			KnowledgeLookupOwnNodes: []event.KnowledgeNodeInfo{
+				{ID: "dev/a", Agent: "developer", Title: "Architecture Alpha"},
+				{ID: "dev/b", Agent: "developer", Title: "Architecture Beta"},
+			},
+		})
+		bus.Emit(event.Event{Type: event.RequestComplete})
+	}()
+
+	r.RenderRequest(bus)
+	screen := emulateTerminalScreen(buf.String())
+
+	if count := strings.Count(screen, "developer using "); count != 1 {
+		t.Fatalf("expected knowledge panel once per task, got %d:\n%s", count, screen)
 	}
 }
 

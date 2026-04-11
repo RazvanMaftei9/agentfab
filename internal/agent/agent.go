@@ -27,6 +27,7 @@ type Agent struct {
 	Def                runtime.AgentDefinition
 	Comm               message.MessageCommunicator
 	Storage            runtime.Storage
+	Workspace          *runtime.Workspace
 	Meter              runtime.Meter
 	Logger             *message.Logger
 	Generate           func(ctx context.Context, input []*schema.Message) (*schema.Message, error)
@@ -36,14 +37,16 @@ type Agent struct {
 	PromptCacheEnabled bool          // When true, skip trimOldToolResults to preserve cache prefix.
 
 	// OnProgress is called with progress text (streaming snippets, tool names).
-	// In local mode this is wired to the event bus; in distributed mode it sends
-	// a StatusUpdate message to the conductor so progress reaches the UI.
+	// In local mode this is typically wired to the event bus; in gRPC-based
+	// runtimes it sends a StatusUpdate message to the conductor so progress
+	// reaches the UI.
 	OnProgress func(text string)
 }
 
 // Run is the main agent loop. It listens for messages and processes them.
 func (a *Agent) Run(ctx context.Context) error {
 	slog.Debug("agent started", "agent", a.Def.Name)
+	defer a.closeWorkspace()
 	ch := a.Comm.Receive(ctx)
 
 	for {
@@ -55,10 +58,39 @@ func (a *Agent) Run(ctx context.Context) error {
 			if !ok {
 				return nil
 			}
+			if err := a.refreshWorkspace(context.WithoutCancel(ctx)); err != nil {
+				slog.Warn("refresh workspace failed", "agent", a.Def.Name, "error", err)
+			}
 			if err := a.handleMessage(ctx, msg); err != nil {
 				slog.Error("agent handle message failed", "agent", a.Def.Name, "error", err)
 			}
+			if err := a.syncWorkspace(context.WithoutCancel(ctx)); err != nil {
+				slog.Warn("sync workspace failed", "agent", a.Def.Name, "error", err)
+			}
 		}
+	}
+}
+
+func (a *Agent) refreshWorkspace(ctx context.Context) error {
+	if a.Workspace == nil {
+		return nil
+	}
+	return a.Workspace.Refresh(ctx)
+}
+
+func (a *Agent) syncWorkspace(ctx context.Context) error {
+	if a.Workspace == nil {
+		return nil
+	}
+	return a.Workspace.Sync(ctx)
+}
+
+func (a *Agent) closeWorkspace() {
+	if a.Workspace == nil {
+		return
+	}
+	if err := a.Workspace.Close(); err != nil {
+		slog.Warn("close workspace failed", "agent", a.Def.Name, "error", err)
 	}
 }
 
@@ -541,8 +573,9 @@ func (a *Agent) emitToolProgress(tc schema.ToolCall) {
 	a.emitProgress("$ " + preview)
 }
 
-// emitProgress sends progress text via the OnProgress callback (distributed mode)
-// or the Events bus (local mode). At least one must be set for progress to appear.
+// emitProgress sends progress text via the OnProgress callback in gRPC-based
+// runtimes or the Events bus in local mode. At least one must be set for
+// progress to appear.
 func (a *Agent) emitProgress(text string) {
 	if a.OnProgress != nil {
 		a.OnProgress(text)
@@ -698,15 +731,9 @@ func (a *Agent) populateScratchWithArtifacts(ctx context.Context) {
 
 	prefix := "artifacts/" + a.Def.Name + "/"
 
-	// List all artifacts for this agent across multiple depths.
-	var allFiles []string
-	for depth := 1; depth <= 5; depth++ {
-		pattern := prefix + strings.Repeat("*/", depth-1) + "*"
-		files, err := a.Storage.List(ctx, runtime.TierShared, pattern)
-		if err != nil {
-			break
-		}
-		allFiles = append(allFiles, files...)
+	allFiles, err := a.Storage.ListAll(ctx, runtime.TierShared, prefix)
+	if err != nil {
+		return
 	}
 
 	if len(allFiles) == 0 {
@@ -853,10 +880,8 @@ func (a *Agent) persistScratchToShared(ctx context.Context, rp *resultParts, exi
 			return nil
 		}
 
-		if len(a.ToolExecutor.TierPaths) >= 3 {
-			if isUpstreamCopy(a.ToolExecutor.TierPaths[2], a.Def.Name, rel, data) {
-				return nil
-			}
+		if isUpstreamCopy(ctx, a.Storage, a.Def.Name, rel, data) {
+			return nil
 		}
 
 		storagePath := rp.dir + "/" + filepath.ToSlash(rel)
@@ -879,18 +904,24 @@ func (a *Agent) persistScratchToShared(ctx context.Context, rp *resultParts, exi
 // isUpstreamCopy checks whether a file in scratch is an exact copy of an
 // artifact produced by a different agent. This prevents persistScratchToShared
 // from re-publishing upstream artifacts under the current agent's name.
-func isUpstreamCopy(sharedDir, agentName, relPath string, data []byte) bool {
-	artifactsDir := filepath.Join(sharedDir, "artifacts")
-	entries, err := os.ReadDir(artifactsDir)
+func isUpstreamCopy(ctx context.Context, storage runtime.Storage, agentName, relPath string, data []byte) bool {
+	artifactFiles, err := storage.ListAll(ctx, runtime.TierShared, "artifacts/")
 	if err != nil {
 		return false
 	}
-	for _, e := range entries {
-		if !e.IsDir() || e.Name() == agentName {
+	for _, artifactPath := range artifactFiles {
+		if !strings.HasPrefix(artifactPath, "artifacts/") {
 			continue
 		}
-		candidate := filepath.Join(artifactsDir, e.Name(), relPath)
-		upstream, err := os.ReadFile(candidate)
+		trimmed := strings.TrimPrefix(artifactPath, "artifacts/")
+		owner, _, ok := strings.Cut(trimmed, "/")
+		if !ok || owner == "" || owner == agentName {
+			continue
+		}
+		if !strings.HasSuffix(artifactPath, "/"+filepath.ToSlash(relPath)) {
+			continue
+		}
+		upstream, err := storage.Read(ctx, runtime.TierShared, artifactPath)
 		if err != nil {
 			continue
 		}
@@ -1380,6 +1411,7 @@ func (a *Agent) handleMessage(ctx context.Context, msg *message.Message) error {
 }
 
 func (a *Agent) executeTask(ctx context.Context, msg *message.Message) error {
+	lc, hasLoopContext := loop.DecodeContext(msg)
 	scope := ""
 	if msg.Metadata != nil {
 		scope = msg.Metadata["task_scope"]
@@ -1396,8 +1428,11 @@ func (a *Agent) executeTask(ctx context.Context, msg *message.Message) error {
 	// Re-materialize work artifacts into scratch if they exist in shared
 	// storage but are missing locally (e.g., WORKING wrote them only via
 	// file blocks in the final response).
-	if lc, ok := loop.DecodeContext(msg); ok && a.ToolExecutor != nil && a.Storage != nil {
+	if hasLoopContext && a.ToolExecutor != nil && a.Storage != nil {
 		a.ensureScratchFromShared(ctx, lc)
+	}
+	if hasLoopContext {
+		a.sendLoopStatusUpdate(ctx, msg, lc)
 	}
 
 	taskInput := a.buildTaskInput(ctx, msg, scope)
@@ -1408,6 +1443,9 @@ func (a *Agent) executeTask(ctx context.Context, msg *message.Message) error {
 
 	if a.Meter != nil {
 		if err := a.Meter.CheckBudget(ctx, a.Def.Name); err != nil {
+			if hasLoopContext {
+				return a.failLoopTask(ctx, msg, lc, fmt.Sprintf("Budget exceeded: %v", err))
+			}
 			return a.sendResult(ctx, msg, fmt.Sprintf("Budget exceeded: %v", err), false, nil, taskMeta(msg))
 		}
 	}
@@ -1418,6 +1456,9 @@ func (a *Agent) executeTask(ctx context.Context, msg *message.Message) error {
 	}
 	resp, toolCallCount, verifyFailed, err := a.generateWithTools(ctx, input, maxIter)
 	if err != nil {
+		if hasLoopContext {
+			return a.failLoopTask(ctx, msg, lc, fmt.Sprintf("model call failed: %v", err))
+		}
 		return a.escalate(ctx, msg, fmt.Sprintf("model call failed: %v", err))
 	}
 
@@ -1446,6 +1487,9 @@ func (a *Agent) executeTask(ctx context.Context, msg *message.Message) error {
 		input = append(input, schema.UserMessage("User's answer: "+answer))
 		resp, toolCallCount, verifyFailed, err = a.generateWithTools(ctx, input, maxIterationsForScope(scope))
 		if err != nil {
+			if hasLoopContext {
+				return a.failLoopTask(ctx, msg, lc, fmt.Sprintf("model call failed after user answer: %v", err))
+			}
 			return a.escalate(ctx, msg, fmt.Sprintf("model call failed after user answer: %v", err))
 		}
 	}
@@ -1454,11 +1498,45 @@ func (a *Agent) executeTask(ctx context.Context, msg *message.Message) error {
 
 	// If this message carries loop context, route within the loop instead of
 	// sending a result back to the original sender.
-	if lc, ok := loop.DecodeContext(msg); ok {
+	if hasLoopContext {
 		return a.completeLoopStep(ctx, msg, resp.Content, a.cumulativeUsage(), lc, toolCallCount)
 	}
 
 	return a.sendResult(ctx, msg, resp.Content, verifyFailed, a.cumulativeUsage(), taskMeta(msg))
+}
+
+func (a *Agent) failLoopTask(ctx context.Context, original *message.Message, lc *loop.LoopContext, reason string) error {
+	content := fmt.Sprintf("Cannot complete task: %s", reason)
+	if a.Def.EscalationTarget != "" {
+		esc := &message.Message{
+			ID:        uuid.New().String(),
+			RequestID: original.RequestID,
+			From:      a.Def.Name,
+			To:        a.Def.EscalationTarget,
+			Type:      message.TypeEscalation,
+			Parts: []message.Part{
+				message.TextPart{Text: reason},
+				message.DataPart{Data: map[string]any{
+					"original_from": original.From,
+					"original_task": extractText(original),
+				}},
+			},
+			Timestamp: time.Now(),
+		}
+
+		if a.Logger != nil {
+			a.Logger.Log(ctx, esc)
+		}
+
+		if err := a.Comm.Send(ctx, esc); err != nil {
+			slog.Warn("failed to send escalation", "agent", a.Def.Name, "target", a.Def.EscalationTarget, "error", err)
+		}
+
+		content = fmt.Sprintf("Escalated to %s: %s", a.Def.EscalationTarget, reason)
+	}
+
+	rp := a.buildResultParts(ctx, original.RequestID, content, true)
+	return a.sendLoopResult(ctx, original, rp, nil, lc, false, true)
 }
 
 type resultParts struct {
@@ -1727,7 +1805,7 @@ func (a *Agent) completeLoopStep(ctx context.Context, msg *message.Message, cont
 			"agent", a.Def.Name, "state", lc.State.CurrentState,
 			"verdict", verdict, "error", err)
 		rp := a.buildResultParts(ctx, msg.RequestID, content, false)
-		return a.sendLoopResult(ctx, msg, rp, usage, lc, true)
+		return a.sendLoopResult(ctx, msg, rp, usage, lc, true, false)
 	}
 
 	fsm := loop.RestoreFSM(lc.Definition, lc.State)
@@ -1739,7 +1817,7 @@ func (a *Agent) completeLoopStep(ctx context.Context, msg *message.Message, cont
 			"agent", a.Def.Name, "state", lc.State.CurrentState,
 			"next", nextState, "error", err)
 		rp := a.buildResultParts(ctx, msg.RequestID, content, false)
-		return a.sendLoopResult(ctx, msg, rp, usage, lc, true)
+		return a.sendLoopResult(ctx, msg, rp, usage, lc, true, false)
 	}
 	if result == loop.Escalated {
 		// Graceful: max transitions reached, FSM auto-escalated.
@@ -1753,7 +1831,7 @@ func (a *Agent) completeLoopStep(ctx context.Context, msg *message.Message, cont
 			LoopCount: fsm.State().TransitionCount,
 		})
 		rp := a.buildResultParts(ctx, msg.RequestID, content, false)
-		return a.sendLoopResult(ctx, msg, rp, usage, lc, true)
+		return a.sendLoopResult(ctx, msg, rp, usage, lc, true, false)
 	}
 
 	a.Events.Emit(event.Event{
@@ -1768,7 +1846,7 @@ func (a *Agent) completeLoopStep(ctx context.Context, msg *message.Message, cont
 
 	if fsm.IsTerminal() {
 		rp := a.buildResultParts(ctx, msg.RequestID, content, false)
-		return a.sendLoopResult(ctx, msg, rp, usage, lc, false)
+		return a.sendLoopResult(ctx, msg, rp, usage, lc, false, false)
 	}
 
 	// Non-terminal: persist this agent's artifacts (so they're visible in the
@@ -1783,7 +1861,7 @@ func (a *Agent) completeLoopStep(ctx context.Context, msg *message.Message, cont
 		// conductor so the task doesn't hang forever as "working".
 		slog.Error("loop forward failed, escalating result to conductor",
 			"agent", a.Def.Name, "next_state", nextState, "error", err)
-		return a.sendLoopResult(ctx, msg, rp, usage, lc, true)
+		return a.sendLoopResult(ctx, msg, rp, usage, lc, true, false)
 	}
 	return nil
 }
@@ -1853,9 +1931,12 @@ func (a *Agent) forwardLoopMessage(ctx context.Context, original *message.Messag
 		OriginalTask:      lc.OriginalTask,
 		UserRequest:       lc.UserRequest,
 		DepParts:          lc.DepParts,
+		AssignedInstances: lc.AssignedInstances,
+		ExecutionNodes:    lc.ExecutionNodes,
 		WorkSummary:       workSummary,
 		WorkArtifactURI:   workArtifactURI,
 		WorkArtifactFiles: workArtifactFiles,
+		DispatchNonce:     lc.DispatchNonce,
 	}
 	parts = append(parts, loop.EncodeContext(updatedLC))
 
@@ -1874,6 +1955,12 @@ func (a *Agent) forwardLoopMessage(ctx context.Context, original *message.Messag
 		if scope := original.Metadata["task_scope"]; scope != "" {
 			fwdMeta["task_scope"] = scope
 		}
+	}
+	if assigned := lc.AssignedInstances[nextAgent]; assigned != "" {
+		fwdMeta["assigned_instance"] = assigned
+	}
+	if executionNode := lc.ExecutionNodes[nextAgent]; executionNode != "" {
+		fwdMeta["execution_node"] = executionNode
 	}
 
 	fwd := &message.Message{
@@ -1894,11 +1981,54 @@ func (a *Agent) forwardLoopMessage(ctx context.Context, original *message.Messag
 	return a.Comm.Send(ctx, fwd)
 }
 
+func (a *Agent) sendLoopStatusUpdate(ctx context.Context, original *message.Message, lc *loop.LoopContext) {
+	if lc == nil || a.Comm == nil || original == nil {
+		return
+	}
+
+	meta := map[string]string{
+		"task_id":    lc.TaskID,
+		"loop_id":    lc.Definition.ID,
+		"loop_state": lc.State.CurrentState,
+	}
+	if lc.DispatchNonce != "" {
+		meta["dispatch_nonce"] = lc.DispatchNonce
+	}
+	if original.Metadata != nil {
+		if assigned := strings.TrimSpace(original.Metadata["assigned_instance"]); assigned != "" {
+			meta["assigned_instance"] = assigned
+		}
+		if executionNode := strings.TrimSpace(original.Metadata["execution_node"]); executionNode != "" {
+			meta["execution_node"] = executionNode
+		}
+	}
+
+	statusMsg := &message.Message{
+		ID:        uuid.New().String(),
+		RequestID: original.RequestID,
+		From:      a.Def.Name,
+		To:        lc.Conductor,
+		Type:      message.TypeStatusUpdate,
+		Parts: []message.Part{
+			message.TextPart{Text: fmt.Sprintf("Loop state %s active on %s", lc.State.CurrentState, a.Def.Name)},
+		},
+		Metadata:  meta,
+		Timestamp: time.Now(),
+	}
+
+	if a.Logger != nil {
+		a.Logger.Log(ctx, statusMsg)
+	}
+	if err := a.Comm.Send(ctx, statusMsg); err != nil {
+		slog.Warn("send loop status update failed", "agent", a.Def.Name, "task_id", lc.TaskID, "error", err)
+	}
+}
+
 // sendLoopResult sends the terminal loop result back to the conductor.
 // If the terminal agent is a reviewer and a WorkSummary exists, the first
 // TextPart is replaced with the worker's summary so the task result reflects
 // what was actually built rather than the review verdict.
-func (a *Agent) sendLoopResult(ctx context.Context, original *message.Message, rp resultParts, usage *message.TokenUsage, lc *loop.LoopContext, escalated bool) error {
+func (a *Agent) sendLoopResult(ctx context.Context, original *message.Message, rp resultParts, usage *message.TokenUsage, lc *loop.LoopContext, escalated, failed bool) error {
 	meta := map[string]string{
 		"task_id": lc.TaskID,
 		"loop_id": lc.Definition.ID,
@@ -1908,6 +2038,17 @@ func (a *Agent) sendLoopResult(ctx context.Context, original *message.Message, r
 	}
 	if escalated {
 		meta["loop_escalated"] = "true"
+	}
+	if failed {
+		meta["status"] = "failed"
+	}
+	if original.Metadata != nil {
+		if assigned := strings.TrimSpace(original.Metadata["assigned_instance"]); assigned != "" {
+			meta["assigned_instance"] = assigned
+		}
+		if executionNode := strings.TrimSpace(original.Metadata["execution_node"]); executionNode != "" {
+			meta["execution_node"] = executionNode
+		}
 	}
 
 	parts := rp.parts

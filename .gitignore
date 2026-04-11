@@ -51,3 +51,9 @@ agents.yaml
 # Claude
 /claude
 CLAUDE.md
+
+# deployment tooling is user-local and not part of the shipped product
+/deploy/
+
+# demo artifact bundles (generated, large, user-local)
+/demo-artifacts/

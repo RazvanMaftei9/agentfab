@@ -176,7 +176,7 @@ func nodeBoxWidth(t event.TaskSummary) int {
 		idW += 2 // " ↻" suffix
 	}
 	w := idW
-	if aw := utf8.RuneCountInString(t.Agent); aw > w {
+	if aw := utf8.RuneCountInString(taskAgentLabel(t)); aw > w {
 		w = aw
 	}
 	icon, _ := taskIcon(t.Status)
@@ -271,7 +271,7 @@ func drawBox(canvas [][]rune, colors [][]string, x, y, w int, t event.TaskSummar
 
 	// Line 1: agent name.
 	setRune(canvas, colors, y+1, x, '│', borderColor)
-	agent := padRight(t.Agent, innerW)
+	agent := padRight(taskAgentLabel(t), innerW)
 	col = x + 1
 	for _, r := range agent {
 		c := agentColor
@@ -304,6 +304,13 @@ func drawBox(canvas [][]rune, colors [][]string, x, y, w int, t event.TaskSummar
 		}
 		setRune(canvas, colors, y+3, x+w-1, '╯', borderColor)
 	}
+}
+
+func taskAgentLabel(t event.TaskSummary) string {
+	if strings.TrimSpace(t.ExecutionNode) == "" {
+		return t.Agent
+	}
+	return t.Agent + "@" + t.ExecutionNode
 }
 
 // drawConnectors renders edge lines between layer li and li+1.

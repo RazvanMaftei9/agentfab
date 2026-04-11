@@ -7,6 +7,7 @@ import (
 	"sync"
 
 	pb "github.com/razvanmaftei/agentfab/gen/agentfab/v1"
+	"github.com/razvanmaftei/agentfab/internal/identity"
 	"github.com/razvanmaftei/agentfab/internal/message"
 	"github.com/razvanmaftei/agentfab/internal/runtime"
 	"google.golang.org/grpc"
@@ -40,18 +41,18 @@ func NewCommunicator(name string, server *Server, discovery runtime.Discovery, t
 }
 
 func (c *Communicator) Send(ctx context.Context, msg *message.Message) error {
-	target := msg.To
-	client, err := c.getClient(ctx, target)
+	routeTarget := dispatchRouteTarget(msg)
+	client, err := c.getClient(ctx, routeTarget)
 	if err != nil {
-		return fmt.Errorf("connect to %q: %w", target, err)
+		return fmt.Errorf("connect to %q: %w", routeTarget, err)
 	}
 	pbMsg := message.ToProto(msg)
 	resp, err := client.SendMessage(ctx, pbMsg)
 	if err != nil {
-		return fmt.Errorf("send to %q: %w", target, err)
+		return fmt.Errorf("send to %q: %w", routeTarget, err)
 	}
 	if !resp.Accepted {
-		return fmt.Errorf("send to %q rejected: %s", target, resp.Error)
+		return fmt.Errorf("send to %q rejected: %s", routeTarget, resp.Error)
 	}
 	return nil
 }
@@ -104,4 +105,28 @@ func (c *Communicator) getClient(ctx context.Context, target string) (pb.AgentSe
 	c.mu.Unlock()
 
 	return pb.NewAgentServiceClient(conn), nil
+}
+
+func dispatchRouteTarget(msg *message.Message) string {
+	if msg == nil {
+		return ""
+	}
+	if msg.Metadata != nil {
+		if assigned := msg.Metadata["assigned_instance"]; assigned != "" && assignedInstanceMatchesRecipient(assigned, msg.To) {
+			return assigned
+		}
+	}
+	return msg.To
+}
+
+func assignedInstanceMatchesRecipient(assignedInstance, recipient string) bool {
+	if identity.NormalizeID(assignedInstance) == identity.NormalizeID(recipient) {
+		return true
+	}
+
+	_, profile, ok := senderInstanceParts(assignedInstance)
+	if !ok {
+		return false
+	}
+	return identity.NormalizeID(profile) == identity.NormalizeID(recipient)
 }

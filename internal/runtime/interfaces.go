@@ -31,6 +31,8 @@ type Storage interface {
 	Append(ctx context.Context, tier StorageTier, path string, data []byte) error
 	// List returns file paths matching a glob pattern.
 	List(ctx context.Context, tier StorageTier, pattern string) ([]string, error)
+	// ListAll returns every file under the given tier prefix.
+	ListAll(ctx context.Context, tier StorageTier, prefix string) ([]string, error)
 	// Exists checks whether a file exists.
 	Exists(ctx context.Context, tier StorageTier, path string) (bool, error)
 	// Delete removes a file or directory. Empty path removes the entire tier root.
@@ -39,6 +41,12 @@ type Storage interface {
 	TierDir(tier StorageTier) string
 	// SharedDir returns the absolute path to the shared storage directory.
 	SharedDir() string
+}
+
+type StorageLayout struct {
+	SharedRoot  string
+	AgentRoot   string
+	ScratchRoot string
 }
 
 // Discovery resolves agent names to endpoints.

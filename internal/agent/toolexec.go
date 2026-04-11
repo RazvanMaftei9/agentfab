@@ -61,6 +61,7 @@ type ToolExecutor struct {
 	AgentName       string
 	MaxOutputTokens int // model's max output tokens
 	ContextLimit    int // model's context window in tokens
+	SyncWorkspace   func(context.Context) error
 
 	mu       sync.Mutex
 	bgGroups []int // process group IDs kept alive for background servers
@@ -204,6 +205,12 @@ func (e *ToolExecutor) Execute(ctx context.Context, call schema.ToolCall) (strin
 		e.mu.Lock()
 		e.bgGroups = append(e.bgGroups, pgid)
 		e.mu.Unlock()
+	}
+
+	if e.SyncWorkspace != nil {
+		if syncErr := e.SyncWorkspace(ctx); syncErr != nil && err == nil {
+			err = fmt.Errorf("sync workspace: %w", syncErr)
+		}
 	}
 
 	if err != nil {

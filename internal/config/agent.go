@@ -39,6 +39,14 @@ func ValidateAgentDefinition(def runtime.AgentDefinition) error {
 	if def.EscalationTarget != "" && !validName.MatchString(def.EscalationTarget) {
 		return fmt.Errorf("agent %q: escalation_target %q is not a valid agent name", def.Name, def.EscalationTarget)
 	}
+	for key, value := range def.RequiredNodeLabels {
+		if strings.TrimSpace(key) == "" {
+			return fmt.Errorf("agent %q: required_node_labels contains an empty key", def.Name)
+		}
+		if strings.TrimSpace(value) == "" {
+			return fmt.Errorf("agent %q: required_node_labels[%q] has an empty value", def.Name, key)
+		}
+	}
 	for i, tc := range def.Tools {
 		if tc.Name == "" {
 			return fmt.Errorf("agent %q: tool at index %d has empty name", def.Name, i)

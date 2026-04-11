@@ -63,8 +63,9 @@ func (g *TaskGraph) ValidateWithRoster(roster []string) error {
 	}
 
 	for _, t := range g.Tasks {
-		if t.Agent != "" && !known[t.Agent] {
-			return fmt.Errorf("task %q assigned to unknown agent %q (known: %v)", t.ID, t.Agent, roster)
+		target := t.TargetProfile()
+		if target != "" && !known[target] {
+			return fmt.Errorf("task %q assigned to unknown agent %q (known: %v)", t.ID, target, roster)
 		}
 	}
 
@@ -251,16 +252,16 @@ func (g *TaskGraph) FailureSummaries() []string {
 		switch t.Status {
 		case StatusFailed:
 			if t.Result != "" {
-				summaries = append(summaries, fmt.Sprintf("Task %s (%s): %s", t.ID, t.Agent, t.Result))
+				summaries = append(summaries, fmt.Sprintf("Task %s (%s): %s", t.ID, t.TargetProfile(), t.Result))
 			} else {
-				summaries = append(summaries, fmt.Sprintf("Task %s (%s): failed", t.ID, t.Agent))
+				summaries = append(summaries, fmt.Sprintf("Task %s (%s): failed", t.ID, t.TargetProfile()))
 			}
 		case StatusEscalated:
 			if len(t.ArtifactFiles) == 0 && t.ArtifactURI == "" {
-				summaries = append(summaries, fmt.Sprintf("Task %s (%s): escalated (review loop exhausted, no artifacts)", t.ID, t.Agent))
+				summaries = append(summaries, fmt.Sprintf("Task %s (%s): escalated (review loop exhausted, no artifacts)", t.ID, t.TargetProfile()))
 			}
 		case StatusCancelled:
-			summaries = append(summaries, fmt.Sprintf("Task %s (%s): cancelled", t.ID, t.Agent))
+			summaries = append(summaries, fmt.Sprintf("Task %s (%s): cancelled", t.ID, t.TargetProfile()))
 		}
 	}
 	return summaries

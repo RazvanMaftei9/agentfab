@@ -216,3 +216,23 @@ func TestStorageScopeBypassViaDotDot(t *testing.T) {
 		t.Fatal("should reject scope bypass via .. within allowed prefix")
 	}
 }
+
+func TestStorageRespectsConfiguredLayout(t *testing.T) {
+	base := t.TempDir()
+	layout := runtime.StorageLayout{
+		SharedRoot:  base + "/fabric-shared",
+		AgentRoot:   base + "/fabric-agents",
+		ScratchRoot: base + "/fabric-scratch",
+	}
+	s := NewStorageWithLayout(layout, "developer")
+
+	if got := s.TierDir(runtime.TierShared); got != layout.SharedRoot {
+		t.Fatalf("shared tier = %q, want %q", got, layout.SharedRoot)
+	}
+	if got := s.TierDir(runtime.TierAgent); got != layout.AgentRoot+"/developer" {
+		t.Fatalf("agent tier = %q", got)
+	}
+	if got := s.TierDir(runtime.TierScratch); got != layout.ScratchRoot+"/agentfab-developer" {
+		t.Fatalf("scratch tier = %q", got)
+	}
+}

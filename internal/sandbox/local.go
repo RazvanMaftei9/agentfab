@@ -51,10 +51,8 @@ func Run(ctx context.Context, cfg Config, env []string, name string, args ...str
 		return nil, 0, fmt.Errorf("create work dir: %w", err)
 	}
 
-	// Local-mode environment: inherit the full host environment so agents
-	// can use installed tools (node, npm, go, python, etc.) with all their
-	// required env vars (GOROOT, NVM_DIR, USER, etc.).
-	// Docker/K8s modes provide real isolation and build their own env.
+	// Local-mode tool execution inherits selected host environment variables so
+	// agents can use installed toolchains (node, npm, go, python, etc.).
 	tmpDir := sandboxTempDir()
 	os.MkdirAll(tmpDir, 0755)
 
@@ -64,8 +62,8 @@ func Run(ctx context.Context, cfg Config, env []string, name string, args ...str
 		"LANG":   "en_US.UTF-8",
 	})
 
-	// Export allowed directories as indexed env vars (informational for local mode;
-	// true filesystem isolation comes in Docker/K8s phases).
+	// Export allowed directories as indexed env vars for tools that want to
+	// understand their permitted workspace.
 	for i, dir := range cfg.AllowedDirs {
 		cmdEnv = append(cmdEnv, fmt.Sprintf("SANDBOX_ALLOWED_DIR_%d=%s", i, dir))
 	}

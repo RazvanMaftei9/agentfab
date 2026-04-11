@@ -21,12 +21,15 @@ type knowledgeTree struct {
 
 // ktNode is a node in the knowledge tree.
 type ktNode struct {
-	id       string
-	agent    string
-	title    string
-	depth    int
-	children []*ktNode
-	isOwn    bool
+	id        string
+	agent     string
+	title     string
+	summary   string
+	tags      []string
+	relations []string
+	depth     int
+	children  []*ktNode
+	isOwn     bool
 }
 
 // buildKnowledgeTree converts event payload into a tree rooted at a virtual root node.
@@ -50,7 +53,7 @@ func buildKnowledgeTree(own []event.KnowledgeNodeInfo, related []event.Knowledge
 
 	// Place own nodes as direct children of root.
 	for _, n := range own {
-		kn := &ktNode{id: n.ID, agent: n.Agent, title: n.Title, depth: 0, isOwn: true}
+		kn := &ktNode{id: n.ID, agent: n.Agent, title: n.Title, summary: n.Summary, tags: append([]string(nil), n.Tags...), depth: 0, isOwn: true}
 		root.children = append(root.children, kn)
 		placed[n.ID] = kn
 		allNodes = append(allNodes, kn)
@@ -66,7 +69,16 @@ func buildKnowledgeTree(own []event.KnowledgeNodeInfo, related []event.Knowledge
 		if _, exists := placed[rn.ID]; exists {
 			continue // dedup
 		}
-		kn := &ktNode{id: rn.ID, agent: rn.Agent, title: rn.Title, depth: rn.Depth, isOwn: false}
+		kn := &ktNode{
+			id:        rn.ID,
+			agent:     rn.Agent,
+			title:     rn.Title,
+			summary:   rn.Summary,
+			tags:      append([]string(nil), rn.Tags...),
+			relations: append([]string(nil), rn.Relations...),
+			depth:     rn.Depth,
+			isOwn:     false,
+		}
 
 		// Find a parent among already-placed nodes via edges.
 		parentNode := findParent(rn.ID, childToParents, placed)
@@ -96,8 +108,8 @@ func sortKnowledgeChildren(n *ktNode) {
 		if a.agent != b.agent {
 			return a.agent < b.agent
 		}
-		la := strings.ToLower(nodeLabel(a.id, a.title))
-		lb := strings.ToLower(nodeLabel(b.id, b.title))
+		la := strings.ToLower(nodeLabel(a.id, a.title, a.summary))
+		lb := strings.ToLower(nodeLabel(b.id, b.title, b.summary))
 		if la != lb {
 			return la < lb
 		}
@@ -121,15 +133,22 @@ func findParent(nodeID string, childToParents map[string][]string, placed map[st
 
 // nodeLabel returns the display label for a knowledge node.
 // Strips the "{agent}/" prefix from the ID if present, prefers title.
-func nodeLabel(id, title string) string {
+func nodeLabel(id, title, summary string) string {
+	title = purposeLabel(title)
+	summary = purposeLabel(summary)
+	if title != "" && !isLowSignalKnowledgeTitle(title) {
+		return title
+	}
+	if summary != "" {
+		return summary
+	}
 	if title != "" {
 		return title
 	}
-	// Strip agent prefix: "agent/slug" → "slug"
 	if idx := strings.IndexByte(id, '/'); idx >= 0 {
-		return id[idx+1:]
+		return purposeLabel(id[idx+1:])
 	}
-	return id
+	return purposeLabel(id)
 }
 
 // renderKnowledgeTreeLines produces terminal lines for the knowledge tree.
@@ -198,13 +217,166 @@ func renderFullTree(tree *knowledgeTree, agent string, frame int, width int, tty
 		return []string{line}
 	}
 
+	return renderKnowledgeSectionsBalanced(tree.root.children, maxContentWidth, agent, frame, tty, colorFn, rootColor)
+}
+
+type knowledgeSection struct {
+	title string
+	nodes []*ktNode
+}
+
+func groupKnowledgeSections(nodes []*ktNode) []knowledgeSection {
+	sections := []knowledgeSection{
+		{title: "Decisions"},
+		{title: "Direct context"},
+		{title: "Related context"},
+	}
+	for _, node := range nodes {
+		switch knowledgeCategory(node) {
+		case "decision":
+			sections[0].nodes = append(sections[0].nodes, node)
+		case "direct":
+			sections[1].nodes = append(sections[1].nodes, node)
+		default:
+			sections[2].nodes = append(sections[2].nodes, node)
+		}
+	}
+	return sections
+}
+
+func knowledgeCategory(n *ktNode) string {
+	if n == nil {
+		return "related"
+	}
+	if knowledgeNodeHasTag(n, "decision") || knowledgeNodeHasRelation(n, "decision") {
+		return "decision"
+	}
+	if n.isOwn || knowledgeNodeHasTag(n, "user-request") || knowledgeNodeHasRelation(n, "user-request") || n.depth <= 1 {
+		return "direct"
+	}
+	return "related"
+}
+
+func knowledgeNodeHasTag(n *ktNode, tag string) bool {
+	for _, existing := range n.tags {
+		if strings.EqualFold(existing, tag) {
+			return true
+		}
+	}
+	return false
+}
+
+func knowledgeNodeHasRelation(n *ktNode, relation string) bool {
+	for _, existing := range n.relations {
+		if strings.EqualFold(existing, relation) {
+			return true
+		}
+	}
+	return false
+}
+
+func renderKnowledgeSectionHeader(title string, tty bool) []string {
+	line := "    " + title
+	if tty {
+		line = "    " + colorWrap(title, Dim, tty)
+	}
+	return []string{line}
+}
+
+type renderedKnowledgeSection struct {
+	title string
+	lines []string
+}
+
+func renderKnowledgeSectionsBalanced(nodes []*ktNode, maxContentWidth int, agent string, frame int, tty bool, colorFn func(string) string, rootColor string) []string {
 	lines := []string{
 		"    " + colorWrap("◆", rootColor, tty),
 	}
-	for i, child := range tree.root.children {
-		renderKnowledgeNodeLines(child, "", i == len(tree.root.children)-1, &lines, maxContentWidth, agent, frame, tty, colorFn)
+
+	sections := groupKnowledgeSections(nodes)
+	rendered := make([]renderedKnowledgeSection, 0, len(sections))
+	totalLines := len(lines)
+	for _, section := range sections {
+		if len(section.nodes) == 0 {
+			continue
+		}
+		body := make([]string, 0)
+		for i, child := range section.nodes {
+			renderKnowledgeNodeLines(child, "", i == len(section.nodes)-1, &body, maxContentWidth, agent, frame, tty, colorFn)
+		}
+		rendered = append(rendered, renderedKnowledgeSection{
+			title: section.title,
+			lines: body,
+		})
+		totalLines += 1 + len(body)
 	}
-	return clampKnowledgeTreeLines(lines, maxKnowledgeTreeLines, tty)
+	if len(rendered) == 0 {
+		return lines
+	}
+	if totalLines <= maxKnowledgeTreeLines {
+		for _, section := range rendered {
+			lines = append(lines, renderKnowledgeSectionHeader(section.title, tty)...)
+			lines = append(lines, section.lines...)
+		}
+		return lines
+	}
+
+	budget := maxKnowledgeTreeLines - len(lines)
+	if budget <= 0 {
+		return lines
+	}
+
+	visiblePerSection := make([]int, len(rendered))
+	used := 0
+	for i := range rendered {
+		if budget == 0 {
+			break
+		}
+		budget--
+		used++
+		if len(rendered[i].lines) == 0 || budget == 0 {
+			continue
+		}
+		visiblePerSection[i] = 1
+		budget--
+		used++
+	}
+
+	for budget > 0 {
+		advanced := false
+		for i := range rendered {
+			if visiblePerSection[i] >= len(rendered[i].lines) {
+				continue
+			}
+			visiblePerSection[i]++
+			budget--
+			used++
+			advanced = true
+			if budget == 0 {
+				break
+			}
+		}
+		if !advanced {
+			break
+		}
+	}
+
+	for i, section := range rendered {
+		lines = append(lines, renderKnowledgeSectionHeader(section.title, tty)...)
+		lines = append(lines, section.lines[:visiblePerSection[i]]...)
+	}
+
+	hidden := totalLines - (len(lines))
+	if hidden > 0 {
+		trunc := knowledgeTruncationLine(hidden, tty)
+		if len(lines) < maxKnowledgeTreeLines {
+			lines = append(lines, trunc)
+		} else if len(lines) > 1 {
+			lines[len(lines)-1] = knowledgeTruncationLine(hidden+1, tty)
+		}
+	}
+
+	return lines
 }
 
 func renderKnowledgeNodeLines(n *ktNode, prefix string, isLast bool, lines *[]string, maxContentWidth int, agent string, frame int, tty bool, colorFn func(string) string) {
@@ -238,7 +410,7 @@ func renderKnowledgeNodeLines(n *ktNode, prefix string, isLast bool, lines *[]st
 }
 
 func knowledgeNodeDisplay(n *ktNode, currentAgent string) string {
-	label := purposeLabel(nodeLabel(n.id, n.title))
+	label := nodeLabel(n.id, n.title, n.summary)
 	if !n.isOwn && n.agent != "" && n.agent != currentAgent {
 		return fmt.Sprintf("%s [%s]", label, n.agent)
 	}
@@ -286,6 +458,21 @@ func purposeLabel(label string) string {
 		label = truncateLabel(label, maxKnowledgeLabelRunes)
 	}
 	return strings.TrimSpace(label)
+}
+
+func isLowSignalKnowledgeTitle(label string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(label))
+	switch normalized {
+	case "", "build", "design", "implementation", "implement", "review", "plan", "task", "work item", "request":
+		return true
+	}
+	if strings.HasPrefix(normalized, "build ") || strings.HasPrefix(normalized, "design ") {
+		return true
+	}
+	if strings.HasPrefix(normalized, "can you ") || strings.HasPrefix(normalized, "create ") {
+		return true
+	}
+	return false
 }
 
 // normalizeKnowledgeTreeLines removes accidental duplicate root rows and
@@ -342,13 +529,17 @@ func clampKnowledgeTreeLines(lines []string, maxLines int, tty bool) []string {
 		return lines
 	}
 	hidden := len(lines) - maxLines + 1
+	out := append([]string{}, lines[:maxLines-1]...)
+	out = append(out, knowledgeTruncationLine(hidden, tty))
+	return out
+}
+
+func knowledgeTruncationLine(hidden int, tty bool) string {
 	trunc := fmt.Sprintf("    └── ... +%d more", hidden)
 	if tty {
 		trunc = "    " + colorWrap("└──", Gray, tty) + " " + colorWrap(fmt.Sprintf("... +%d more", hidden), Gray, tty)
 	}
-	out := append([]string{}, lines[:maxLines-1]...)
-	out = append(out, trunc)
-	return out
+	return trunc
 }
 
 // renderTruncated renders root + leaf labels in a compact form.
@@ -407,7 +598,7 @@ func collectLeafLabels(n *ktNode, labels *[]string) {
 		return
 	}
 	if len(n.children) == 0 {
-		*labels = append(*labels, nodeLabel(n.id, n.title))
+		*labels = append(*labels, nodeLabel(n.id, n.title, n.summary))
 		return
 	}
 	for _, c := range n.children {

@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"time"
 
 	"gopkg.in/yaml.v3"
 
@@ -15,8 +16,8 @@ import (
 	"github.com/razvanmaftei/agentfab/defaults"
 	"github.com/razvanmaftei/agentfab/internal/agent"
 	"github.com/razvanmaftei/agentfab/internal/config"
+	"github.com/razvanmaftei/agentfab/internal/controlplane"
 	"github.com/razvanmaftei/agentfab/internal/event"
-	agentgrpc "github.com/razvanmaftei/agentfab/internal/grpc"
 	"github.com/razvanmaftei/agentfab/internal/llm"
 	"github.com/razvanmaftei/agentfab/internal/local"
 	"github.com/razvanmaftei/agentfab/internal/message"
@@ -29,7 +30,7 @@ func Setup(ctx context.Context, c *Conductor) error {
 		return fmt.Errorf("validate agents: %w", err)
 	}
 
-	configFilePath := filepath.Join(c.BaseDir, "shared", "agents.yaml")
+	configFilePath := filepath.Join(c.StorageLayout.SharedRoot, "agents.yaml")
 	if err := os.MkdirAll(filepath.Dir(configFilePath), 0755); err != nil {
 		return fmt.Errorf("create shared dir: %w", err)
 	}
@@ -39,7 +40,7 @@ func Setup(ctx context.Context, c *Conductor) error {
 
 	for _, def := range c.FabricDef.Agents {
 		if def.SpecialKnowledgeFile != "" {
-			if err := writeSpecialKnowledge(c.BaseDir, c.FabricDef.AgentsDir, def); err != nil {
+			if err := writeSpecialKnowledge(ctx, c.StorageFactory(def.Name), c.FabricDef.AgentsDir, def); err != nil {
 				slog.Warn("could not write special knowledge", "agent", def.Name, "error", err)
 			}
 		}
@@ -54,7 +55,18 @@ func Setup(ctx context.Context, c *Conductor) error {
 			AgentName:  def.Name,
 			AgentModel: def.Model,
 		})
-		if err := spawnAgent(ctx, c, def, c.FabricDef.Agents); err != nil {
+		if c.ExternalAgents {
+			if err := waitForExternalAgentInstance(ctx, c, def.Name, 30*time.Second); err != nil {
+				return fmt.Errorf("wait for external agent %q: %w", def.Name, err)
+			}
+			c.Events.Emit(event.Event{
+				Type:       event.AgentReady,
+				AgentName:  def.Name,
+				AgentModel: def.Model,
+			})
+			continue
+		}
+		if err := spawnLocalAgent(ctx, c, def, c.FabricDef.Agents); err != nil {
 			return fmt.Errorf("spawn agent %q: %w", def.Name, err)
 		}
 		c.Events.Emit(event.Event{
@@ -64,55 +76,49 @@ func Setup(ctx context.Context, c *Conductor) error {
 		})
 	}
 
-	// In distributed mode, write peer addresses so agents can discover each
-	// other for direct communication (e.g., loop task forwarding).
-	if c.Distributed {
-		if pl, ok := c.Lifecycle.(*agentgrpc.ProcessLifecycle); ok {
-			if err := pl.WritePeers(); err != nil {
-				slog.Warn("failed to write peers file", "error", err)
-			}
-		}
-	}
-
 	c.Events.Emit(event.Event{Type: event.AllAgentsReady})
 	slog.Info("fabric setup complete", "agents", len(c.FabricDef.Agents))
 	return nil
 }
 
-func spawnAgent(ctx context.Context, c *Conductor, def runtime.AgentDefinition, peers []runtime.AgentDefinition) error {
-	// In distributed mode, the agent runs as a separate OS process.
-	// The ProcessLifecycle handles spawning, heartbeat readiness, and
-	// discovery registration. We only need to write config files to disk.
-	if c.Distributed {
-		return spawnDistributedAgent(ctx, c, def)
-	}
-
-	return spawnLocalAgent(ctx, c, def, peers)
-}
-
-func spawnDistributedAgent(ctx context.Context, c *Conductor, def runtime.AgentDefinition) error {
-	if len(def.Tools) > 0 {
-		if err := writeToolsYAML(c.BaseDir, def); err != nil {
+func waitForExternalAgentInstance(ctx context.Context, c *Conductor, profile string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		instances, err := c.ControlPlane.ListInstances(ctx, controlplane.InstanceFilter{Profile: profile})
+		if err != nil {
 			return err
 		}
-	}
+		for _, instance := range instances {
+			switch instance.State {
+			case controlplane.InstanceStateReady, controlplane.InstanceStateBusy:
+				return nil
+			}
+		}
 
-	if def.Budget != nil {
-		c.Meter.SetBudget(ctx, def.Name, *def.Budget)
-	}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("timed out waiting for ready instance")
+		}
 
-	return c.Lifecycle.Spawn(ctx, def, nil)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
 }
 
 func spawnLocalAgent(ctx context.Context, c *Conductor, def runtime.AgentDefinition, peers []runtime.AgentDefinition) error {
 	c.Discovery.Register(ctx, def.Name, runtime.Endpoint{Address: "local", Local: true})
 	comm := c.CommFactory.Register(def.Name)
 	storage := c.StorageFactory(def.Name)
+	workspace, err := runtime.OpenWorkspace(ctx, storage)
+	if err != nil {
+		return fmt.Errorf("materialize workspace for %q: %w", def.Name, err)
+	}
 
 	specialKnowledge := ""
 	if def.SpecialKnowledgeFile != "" {
-		skPath := filepath.Join(c.BaseDir, "agents", def.Name, "special_knowledge.md")
-		if data, err := os.ReadFile(skPath); err == nil {
+		if data, err := storage.Read(ctx, runtime.TierAgent, "special_knowledge.md"); err == nil {
 			specialKnowledge = string(data)
 		}
 	}
@@ -121,7 +127,12 @@ func spawnLocalAgent(ctx context.Context, c *Conductor, def runtime.AgentDefinit
 	generateFn := c.createGenerateFn(ctx, def)
 
 	if len(def.Tools) > 0 {
-		if err := writeToolsYAML(c.BaseDir, def); err != nil {
+		if err := writeToolsYAML(ctx, storage, def); err != nil {
+			_ = workspace.Close()
+			return err
+		}
+		if err := workspace.Agent.Refresh(ctx); err != nil {
+			_ = workspace.Close()
 			return err
 		}
 	}
@@ -130,15 +141,12 @@ func spawnLocalAgent(ctx context.Context, c *Conductor, def runtime.AgentDefinit
 	liveTools := agent.LiveTools(def.Tools)
 	if len(liveTools) > 0 {
 		toolExec = &agent.ToolExecutor{
-			Tools: liveTools,
-			TierPaths: []string{
-				storage.TierDir(runtime.TierScratch),
-				storage.TierDir(runtime.TierAgent),
-				storage.TierDir(runtime.TierShared),
-			},
+			Tools:           liveTools,
+			TierPaths:       workspace.TierPaths(),
 			AgentName:       def.Name,
 			MaxOutputTokens: llm.MaxOutputTokens(def.Model),
 			ContextLimit:    llm.ContextLimit(def.Model),
+			SyncWorkspace:   workspace.Sync,
 		}
 	}
 
@@ -146,6 +154,7 @@ func spawnLocalAgent(ctx context.Context, c *Conductor, def runtime.AgentDefinit
 		Def:                def,
 		Comm:               comm,
 		Storage:            storage,
+		Workspace:          workspace,
 		Meter:              c.Meter,
 		Logger:             message.NewLogger(local.NewSharedAppender(c.StorageFactory(def.Name))),
 		Generate:           generateFn,
@@ -164,11 +173,7 @@ func spawnLocalAgent(ctx context.Context, c *Conductor, def runtime.AgentDefinit
 	})
 }
 
-func writeToolsYAML(baseDir string, def runtime.AgentDefinition) error {
-	agentDir := filepath.Join(baseDir, "agents", def.Name)
-	if err := os.MkdirAll(agentDir, 0755); err != nil {
-		return fmt.Errorf("create agent dir for tools.yaml: %w", err)
-	}
+func writeToolsYAML(ctx context.Context, storage runtime.Storage, def runtime.AgentDefinition) error {
 	type toolEntry struct {
 		Name         string `yaml:"name"`
 		Instructions string `yaml:"instructions"`
@@ -181,7 +186,7 @@ func writeToolsYAML(baseDir string, def runtime.AgentDefinition) error {
 	if err != nil {
 		return fmt.Errorf("marshal tools.yaml for %q: %w", def.Name, err)
 	}
-	if err := os.WriteFile(filepath.Join(agentDir, "tools.yaml"), data, 0644); err != nil {
+	if err := storage.Write(ctx, runtime.TierAgent, "tools.yaml", data); err != nil {
 		return fmt.Errorf("write tools.yaml for %q: %w", def.Name, err)
 	}
 	return nil
@@ -242,8 +247,8 @@ func (c *Conductor) createGenerateFn(ctx context.Context, def runtime.AgentDefin
 						})
 					}
 				},
-				DebugLog:  c.DebugLog,
-				Options:   llm.ProviderOptions(def.Model, c.FabricDef.Providers),
+				DebugLog: c.DebugLog,
+				Options:  llm.ProviderOptions(def.Model, c.FabricDef.Providers),
 			}
 			return metered.Generate(callCtx, input)
 		}
@@ -253,7 +258,7 @@ func (c *Conductor) createGenerateFn(ctx context.Context, def runtime.AgentDefin
 	}
 }
 
-func writeSpecialKnowledge(baseDir string, agentsDir string, def runtime.AgentDefinition) error {
+func writeSpecialKnowledge(ctx context.Context, storage runtime.Storage, agentsDir string, def runtime.AgentDefinition) error {
 	var data []byte
 
 	// 1. Try agents dir on disk.
@@ -275,9 +280,5 @@ func writeSpecialKnowledge(baseDir string, agentsDir string, def runtime.AgentDe
 		return nil // Not found anywhere — graceful.
 	}
 
-	agentDir := filepath.Join(baseDir, "agents", def.Name)
-	if err := os.MkdirAll(agentDir, 0755); err != nil {
-		return err
-	}
-	return os.WriteFile(filepath.Join(agentDir, "special_knowledge.md"), data, 0644)
+	return storage.Write(ctx, runtime.TierAgent, "special_knowledge.md", data)
 }

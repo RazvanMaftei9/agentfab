@@ -33,6 +33,19 @@ const cliShutdownTimeout = 15 * time.Second
 var exitProcess = os.Exit
 
 func main() {
+	root := newRootCommand()
+
+	if args := defaultRootArgs(os.Args[1:]); len(args) > 0 {
+		root.SetArgs(args)
+	}
+
+	if err := root.Execute(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+}
+
+func newRootCommand() *cobra.Command {
 	root := &cobra.Command{
 		Use:     "agentfab",
 		Short:   "AgentFab -- distributed AI agent orchestration",
@@ -46,11 +59,18 @@ func main() {
 	root.AddCommand(metricsCmd())
 	root.AddCommand(benchCmd())
 	root.AddCommand(agentCmd())
+	root.AddCommand(nodeCmd())
+	root.AddCommand(controlPlaneCmd())
+	root.AddCommand(setupCmd())
 
-	if err := root.Execute(); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+	return root
+}
+
+func defaultRootArgs(args []string) []string {
+	if len(args) == 0 {
+		return []string{"run"}
 	}
+	return nil
 }
 
 func initCmd() *cobra.Command {
@@ -65,70 +85,35 @@ func initCmd() *cobra.Command {
 		Use:   "init",
 		Short: "Initialize a new fabric with default or custom agents",
 		RunE: func(cmd *cobra.Command, args []string) error {
+			w := os.Stdout
+			tty := ui.IsTTY(os.Stdin)
+
 			if name == "" {
 				name = filepath.Base(mustCwd())
 			}
 
 			path := "agents.yaml"
 			if _, err := os.Stat(path); err == nil {
-				fmt.Println("agents.yaml already exists")
+				fmt.Fprintf(w, "  agents.yaml already exists in this directory.\n")
 				return nil
+			}
+
+			var ti *ui.TermInput
+			if tty {
+				ti = ui.NewTermInput()
+				defer ti.Close()
 			}
 
 			useCustom := custom
 			if !useCustom && !cmd.Flags().Changed("custom") {
-				fmt.Println("Choose agent setup:")
-				fmt.Println("  [1] Default agents (architect, developer, designer)")
-				fmt.Println("  [2] Custom agents (provide .md description files)")
-				fmt.Print("Choice [1]: ")
-				reader := bufio.NewReader(os.Stdin)
-				line, _ := reader.ReadString('\n')
-				line = strings.TrimSpace(line)
-				if line == "2" {
-					useCustom = true
-				}
+				useCustom = initPickAgentMode(w, ti, tty)
 			}
 
 			if useCustom {
-				return initCustom(name, descriptDir, defaultModel)
+				return initCustom(w, ti, tty, name, descriptDir, defaultModel)
 			}
 
-			if err := config.ExtractDefaultAgents(defaults.AgentFS, agentsDir); err != nil {
-				return fmt.Errorf("extract default agents: %w", err)
-			}
-			fmt.Printf("Extracted default agents to %s/\n", agentsDir)
-
-			td := &config.FabricDef{
-				Fabric: config.FabricMeta{
-					Name:    name,
-					Version: 1,
-				},
-				AgentsDir: agentsDir,
-				Defaults:  config.FabricDefaults{},
-			}
-			if err := td.ResolveAgents(); err != nil {
-				return fmt.Errorf("resolve agents: %w", err)
-			}
-
-			if err := config.WriteFabricDef(path, td); err != nil {
-				return err
-			}
-			fmt.Printf("Created %s with %d agents\n", path, len(td.Agents))
-			fmt.Printf("Default data directory: %s\n", config.DefaultDataDir())
-			for _, a := range td.Agents {
-				fmt.Printf("  - %s (%s)\n", a.Name, a.Model)
-			}
-
-			manifest, err := config.GenerateManifest(agentsDir)
-			if err != nil {
-				return fmt.Errorf("generate manifest: %w", err)
-			}
-			manifestPath := config.ManifestPath(agentsDir)
-			if err := config.WriteManifest(manifestPath, manifest); err != nil {
-				return fmt.Errorf("write manifest: %w", err)
-			}
-			fmt.Printf("Generated integrity manifest: %s (%d files)\n", manifestPath, len(manifest.Checksums))
-			return nil
+			return initDefault(w, name, agentsDir, path)
 		},
 	}
 	cmd.Flags().StringVar(&name, "name", "", "Fabric name (defaults to directory name)")
@@ -139,20 +124,120 @@ func initCmd() *cobra.Command {
 	return cmd
 }
 
-// initCustom handles the custom agents init path.
-func initCustom(name, descriptDir, defaultModel string) error {
+func initPickAgentMode(w *os.File, ti *ui.TermInput, tty bool) bool {
+	fmt.Fprintf(w, "\n  %s%sAgent Setup%s\n\n", ui.Bold, ui.Teal, ui.Reset)
+
+	defaultAgents := config.DefaultProfiles()
+
+	fmt.Fprintf(w, "  %sDefault agents:%s\n", ui.Dim, ui.Reset)
+	for _, a := range defaultAgents {
+		if a.Name == "conductor" {
+			continue
+		}
+		fmt.Fprintf(w, "    %s%s%s  %s%s%s\n",
+			ui.Bold, a.Name, ui.Reset,
+			ui.Dim, a.Purpose, ui.Reset)
+	}
+	fmt.Fprintf(w, "    %s%s%s  %s%s%s\n",
+		ui.Bold, "conductor", ui.Reset,
+		ui.Dim, "Request decomposition, orchestration, and user I/O (always present)", ui.Reset)
+	fmt.Fprintln(w)
+
+	options := []string{
+		"Use default agents",
+		"Use custom agents (provide .md descriptions)",
+	}
+
+	if tty && ti != nil {
+		choice := initArrowSelect(w, ti, options)
+		return choice == 1
+	}
+
+	for i, opt := range options {
+		fmt.Fprintf(w, "  [%d] %s\n", i+1, opt)
+	}
+	fmt.Fprint(w, "  Choice [1]: ")
+	reader := bufio.NewReader(os.Stdin)
+	line, _ := reader.ReadString('\n')
+	return strings.TrimSpace(line) == "2"
+}
+
+func initDefault(w *os.File, name, agentsDir, path string) error {
+	if err := config.ExtractDefaultAgents(defaults.AgentFS, agentsDir); err != nil {
+		return fmt.Errorf("extract default agents: %w", err)
+	}
+
+	td := &config.FabricDef{
+		Fabric: config.FabricMeta{
+			Name:    name,
+			Version: 1,
+		},
+		AgentsDir: agentsDir,
+		Defaults:  config.FabricDefaults{},
+	}
+	if err := td.ResolveAgents(); err != nil {
+		return fmt.Errorf("resolve agents: %w", err)
+	}
+
+	if err := config.WriteFabricDef(path, td); err != nil {
+		return err
+	}
+
+	manifest, err := config.GenerateManifest(agentsDir)
+	if err != nil {
+		return fmt.Errorf("generate manifest: %w", err)
+	}
+	manifestPath := config.ManifestPath(agentsDir)
+	if err := config.WriteManifest(manifestPath, manifest); err != nil {
+		return fmt.Errorf("write manifest: %w", err)
+	}
+	bundle, err := config.GenerateSignedBundle(td)
+	if err != nil {
+		return fmt.Errorf("generate bundle: %w", err)
+	}
+	if err := config.WriteSignedBundle(config.BundlePath(agentsDir), bundle); err != nil {
+		return fmt.Errorf("write bundle: %w", err)
+	}
+
+	fmt.Fprintln(w)
+	fmt.Fprintf(w, "  %s%s Created %s%s with %d agents\n", ui.Green, checkMark, path, ui.Reset, len(td.Agents))
+	for _, a := range td.Agents {
+		fmt.Fprintf(w, "    %s%s%s  %s%s%s\n",
+			ui.Bold, a.Name, ui.Reset,
+			ui.Dim, a.Model, ui.Reset)
+	}
+	fmt.Fprintf(w, "\n  Agent definitions: %s%s/%s\n", ui.Dim, agentsDir, ui.Reset)
+	fmt.Fprintf(w, "  Data directory:    %s%s%s\n\n", ui.Dim, config.DefaultDataDir(), ui.Reset)
+
+	return nil
+}
+
+func initCustom(w *os.File, ti *ui.TermInput, tty bool, name, descriptDir, defaultModel string) error {
 	if _, err := os.Stat(descriptDir); os.IsNotExist(err) {
-		fmt.Printf("Directory %q not found.\n", descriptDir)
-		fmt.Print("Path to directory of agent .md descriptions: ")
-		reader := bufio.NewReader(os.Stdin)
-		line, _ := reader.ReadString('\n')
-		line = strings.TrimSpace(line)
-		if line != "" {
-			descriptDir = line
+		fmt.Fprintf(w, "\n  Directory %s%s%s not found.\n\n", ui.Bold, descriptDir, ui.Reset)
+
+		prompt := fmt.Sprintf("  %sPath to agent .md descriptions%s: ", ui.Bold, ui.Reset)
+		if ti != nil {
+			line, ok := ti.ReadLine(w, prompt)
+			if !ok {
+				return fmt.Errorf("interrupted")
+			}
+			line = strings.TrimSpace(line)
+			if line != "" {
+				descriptDir = line
+			}
+		} else {
+			fmt.Fprint(w, prompt)
+			reader := bufio.NewReader(os.Stdin)
+			line, _ := reader.ReadString('\n')
+			line = strings.TrimSpace(line)
+			if line != "" {
+				descriptDir = line
+			}
 		}
 	}
 
-	fmt.Printf("Compiling agent descriptions from %s/\n", descriptDir)
+	fmt.Fprintf(w, "\n  Compiling agents from %s%s/%s\n", ui.Dim, descriptDir, ui.Reset)
 
 	configPath, err := config.InitProjectCustom(name, ".", descriptDir, defaultModel)
 	if err != nil {
@@ -163,22 +248,107 @@ func initCustom(name, descriptDir, defaultModel string) error {
 	if err != nil {
 		return fmt.Errorf("load generated config: %w", err)
 	}
-	fmt.Printf("Created %s with %d agents\n", configPath, len(td.Agents))
+
+	fmt.Fprintln(w)
+	fmt.Fprintf(w, "  %s%s Created %s%s with %d agents\n", ui.Green, checkMark, configPath, ui.Reset, len(td.Agents))
 	for _, a := range td.Agents {
-		fmt.Printf("  - %s (%s)\n", a.Name, a.Model)
+		fmt.Fprintf(w, "    %s%s%s  %s%s%s\n",
+			ui.Bold, a.Name, ui.Reset,
+			ui.Dim, a.Model, ui.Reset)
 	}
+	fmt.Fprintln(w)
+
 	return nil
 }
 
+func initArrowSelect(w *os.File, ti *ui.TermInput, options []string) int {
+	selected := 0
+
+	if err := ti.EnterRaw(); err != nil {
+		return 0
+	}
+	keyCh := ti.StartKeyEvents()
+
+	lines := drawInitArrowSelect(w, options, selected)
+
+	for {
+		key, ok := <-keyCh
+		if !ok {
+			break
+		}
+		switch {
+		case key.Key == "up":
+			if selected > 0 {
+				selected--
+				initEraseLines(w, lines)
+				lines = drawInitArrowSelect(w, options, selected)
+			}
+		case key.Key == "down":
+			if selected < len(options)-1 {
+				selected++
+				initEraseLines(w, lines)
+				lines = drawInitArrowSelect(w, options, selected)
+			}
+		case key.Key == "enter":
+			ti.StopKeyEvents()
+			ti.Drain()
+			ti.ExitRaw()
+			initEraseLines(w, lines)
+			fmt.Fprintf(w, "  %s%s %s%s\n", ui.Cyan, ui.ConnArrow, options[selected], ui.Reset)
+			return selected
+		case key.Rune >= '1' && key.Rune <= '9':
+			idx := int(key.Rune - '1')
+			if idx < len(options) {
+				ti.StopKeyEvents()
+				ti.Drain()
+				ti.ExitRaw()
+				initEraseLines(w, lines)
+				fmt.Fprintf(w, "  %s%s %s%s\n", ui.Cyan, ui.ConnArrow, options[idx], ui.Reset)
+				return idx
+			}
+		}
+	}
+
+	ti.ExitRaw()
+	return selected
+}
+
+func drawInitArrowSelect(w *os.File, options []string, selected int) int {
+	lines := 0
+	for i, opt := range options {
+		if i == selected {
+			fmt.Fprintf(w, "  %s▸ %s%s%s\n", ui.Cyan, ui.Bold, opt, ui.Reset)
+		} else {
+			fmt.Fprintf(w, "    %s%s%s\n", ui.Dim, opt, ui.Reset)
+		}
+		lines++
+	}
+	fmt.Fprintf(w, "  %s↑↓%s%s navigate  %sEnter%s%s select%s\n",
+		ui.Bold, ui.Reset, ui.Dim, ui.Bold, ui.Reset, ui.Dim, ui.Reset)
+	lines++
+	return lines
+}
+
+func initEraseLines(w *os.File, n int) {
+	if n > 0 {
+		fmt.Fprint(w, strings.Repeat(ui.MoveUp+ui.ClearLn, n))
+	}
+}
+
+const checkMark = "✓"
+
 func runCmd() *cobra.Command {
 	var (
-		configFile  string
-		agentsDir   string
-		dataDir     string
-		debug       bool
-		skipVerify  bool
-		distributed bool
-		listenAddr  string
+		configFile          string
+		agentsDir           string
+		dataDir             string
+		debug               bool
+		skipVerify          bool
+		listenAddr          string
+		advertiseAddr       string
+		controlPlaneAddress string
+		externalNodes       bool
+		bootstrapNodes      int
 	)
 	cmd := &cobra.Command{
 		Use:   "run",
@@ -257,7 +427,7 @@ func runCmd() *cobra.Command {
 							}
 							configFile = existingCfg
 							projectDir = dir
-							if !cmd.Flags().Changed("data") {
+							if !cmd.Flags().Changed("data-dir") {
 								dataDir = dir
 							}
 							fmt.Printf("Registered existing project %q at %s\n", name, dir)
@@ -272,7 +442,7 @@ func runCmd() *cobra.Command {
 							}
 							configFile = cfgPath
 							projectDir = dir
-							if !cmd.Flags().Changed("data") {
+							if !cmd.Flags().Changed("data-dir") {
 								dataDir = dir
 							}
 							fmt.Printf("Created project %q at %s\n", name, dir)
@@ -297,7 +467,7 @@ func runCmd() *cobra.Command {
 									fmt.Printf("Recreated project %q at %s\n", found.Name, found.Dir)
 									configFile = cfgPath
 									projectDir = found.Dir
-									if !cmd.Flags().Changed("data") {
+									if !cmd.Flags().Changed("data-dir") {
 										dataDir = found.Dir
 									}
 									if entries, err = config.TouchProject(entries, selection); err != nil {
@@ -311,7 +481,7 @@ func runCmd() *cobra.Command {
 						}
 						configFile = projectConfig
 						projectDir = found.Dir
-						if !cmd.Flags().Changed("data") {
+						if !cmd.Flags().Changed("data-dir") {
 							dataDir = found.Dir
 						}
 						if entries, err = config.TouchProject(entries, selection); err != nil {
@@ -333,43 +503,31 @@ func runCmd() *cobra.Command {
 				if err := td.ResolveAgents(); err != nil {
 					return fmt.Errorf("resolve agents from %q: %w", agentsDir, err)
 				}
-			} else if projectDir != "" && td.AgentsDir != "" && !filepath.IsAbs(td.AgentsDir) {
-				td.AgentsDir = filepath.Join(projectDir, td.AgentsDir)
-				td.Agents = nil
-				if err := td.ResolveAgents(); err != nil {
-					return fmt.Errorf("resolve agents from project dir: %w", err)
+			} else if projectDir != "" {
+				if err := config.ResolvePathsRelativeToConfig(td, configFile); err != nil {
+					return err
 				}
 			}
 
-			effectiveAgentsDir := td.AgentsDir
-			if !skipVerify && effectiveAgentsDir != "" {
-				manifestPath := config.ManifestPath(effectiveAgentsDir)
-				if manifest, err := config.LoadManifest(manifestPath); err == nil {
-					ok, mismatches, verifyErr := config.VerifyManifest(effectiveAgentsDir, manifest)
-					if verifyErr != nil {
-						fmt.Fprintf(os.Stderr, "Warning: manifest verification error: %v\n", verifyErr)
-					} else if !ok {
-						fmt.Fprintf(os.Stderr, "Warning: agent integrity verification failed:\n")
-						for _, m := range mismatches {
-							fmt.Fprintf(os.Stderr, "  - %s\n", m)
+			var verifiedBundle config.BundleVerificationResult
+			if !skipVerify {
+				verifiedBundle, err = config.VerifySignedBundle(td)
+				if err != nil {
+					if tty {
+						fmt.Fprintf(os.Stderr, "Warning: agent bundle verification failed: %v\n", err)
+						fmt.Fprint(os.Stderr, "Continue anyway? [y/N] ")
+						answer, ok := pickerReadLine()
+						if !ok {
+							return fmt.Errorf("aborted: agent files have been modified")
 						}
-						if tty {
-							fmt.Fprint(os.Stderr, "Continue anyway? [y/N] ")
-							answer, ok := pickerReadLine()
-							if !ok {
-								return fmt.Errorf("aborted: agent files have been modified")
-							}
-							answer = strings.TrimSpace(strings.ToLower(answer))
-							if answer != "y" && answer != "yes" {
-								return fmt.Errorf("aborted: agent files have been modified")
-							}
-						} else {
-							return fmt.Errorf("agent integrity verification failed (use --skip-verify to bypass)")
+						answer = strings.TrimSpace(strings.ToLower(answer))
+						if answer != "y" && answer != "yes" {
+							return fmt.Errorf("aborted: agent files have been modified")
 						}
+					} else {
+						return fmt.Errorf("agent bundle verification failed: %w (use --skip-verify to bypass)", err)
 					}
 				}
-				// If manifest doesn't exist, skip verification silently
-				// (project may not have been initialized with manifest support).
 			}
 
 			baseDir := dataDir
@@ -385,16 +543,48 @@ func runCmd() *cobra.Command {
 				return llm.NewChatModel(ctx, modelID, nil, td.Providers)
 			}
 
+			bootstrapNodeCount, err := resolveBootstrapNodeCount(td, externalNodes, controlPlaneAddress, bootstrapNodes, cmd.Flags().Changed("bootstrap-nodes"))
+			if err != nil {
+				return err
+			}
+			listenAddr = localBootstrapListenAddr(bootstrapNodeCount > 0, listenAddr, cmd.Flags().Changed("listen"))
+
+			var cluster *localCluster
+			if bootstrapNodeCount > 0 {
+				cluster, err = startLocalCluster(context.Background(), td, baseDir, verifiedBundle, bootstrapNodeCount, debug, factory)
+				if err != nil {
+					return fmt.Errorf("start local distributed cluster: %w", err)
+				}
+				controlPlaneAddress = cluster.controlPlaneAddress
+				fmt.Printf("Control plane: %s\n", controlPlaneAddress)
+				fmt.Printf("Bootstrap nodes: %d\n", len(bootstrapNodeSummary(cluster)))
+			}
+
+			startupSummary := ui.StartupSummary{
+				RuntimeMode:         runtimeModeLabel(externalNodes),
+				ControlPlaneAddress: startupControlPlaneAddress(externalNodes, controlPlaneAddress),
+			}
+			if cluster != nil {
+				startupSummary.BootstrapNodeIDs = bootstrapNodeSummary(cluster)
+			}
+
 			var conductorOpts []conductor.Option
-			if distributed {
-				conductorOpts = append(conductorOpts, conductor.WithDistributed())
+			if externalNodes {
+				conductorOpts = append(conductorOpts, conductor.WithExternalAgents())
 				if listenAddr != "" {
 					conductorOpts = append(conductorOpts, conductor.WithConductorListenAddr(listenAddr))
 				}
+				if advertiseAddr != "" {
+					conductorOpts = append(conductorOpts, conductor.WithConductorAdvertiseAddr(advertiseAddr))
+				}
+				if controlPlaneAddress != "" {
+					conductorOpts = append(conductorOpts, conductor.WithControlPlaneAddress(controlPlaneAddress))
+				}
+			}
+			if verifiedBundle.BundleDigest != "" {
+				conductorOpts = append(conductorOpts, conductor.WithBundleDigests(verifiedBundle.BundleDigest, verifiedBundle.ProfileDigests))
 			}
 
-			// Debug logging must be set up before conductor.New() so that
-			// distributed mode can propagate --debug to spawned agent processes.
 			var debugStore *llm.DebugStore
 			if debug {
 				debugDir := filepath.Join(baseDir, "debug")
@@ -410,6 +600,9 @@ func runCmd() *cobra.Command {
 
 			c, err := conductor.New(td, baseDir, factory, startupBus, conductorOpts...)
 			if err != nil {
+				if cluster != nil {
+					_ = cluster.Shutdown(context.Background())
+				}
 				fmt.Fprintf(os.Stderr, "\nError: %v\n", err)
 				return fmt.Errorf("create conductor: %w", err)
 			}
@@ -438,7 +631,15 @@ func runCmd() *cobra.Command {
 			shutdownNow := func() {
 				shutdownOnce.Do(func() {
 					fmt.Fprintln(os.Stdout, "Shutting down...")
-					reportShutdownResult(os.Stderr, shutdownFabric(cancel, termInput, c.Shutdown))
+					reportShutdownResult(os.Stderr, shutdownFabric(cancel, termInput, func(shutdownCtx context.Context) error {
+						if err := c.Shutdown(shutdownCtx); err != nil {
+							return err
+						}
+						if cluster != nil {
+							return cluster.Shutdown(shutdownCtx)
+						}
+						return nil
+					}))
 				})
 			}
 			defer shutdownNow()
@@ -470,7 +671,7 @@ func runCmd() *cobra.Command {
 				startErr <- err
 			}()
 
-			renderer.RenderStartup(startupBus, td.Fabric.Name, len(td.Agents))
+			renderer.RenderStartup(startupBus, td.Fabric.Name, len(td.Agents), startupSummary)
 
 			select {
 			case err := <-startErr:
@@ -701,11 +902,14 @@ func runCmd() *cobra.Command {
 	}
 	cmd.Flags().StringVar(&configFile, "config", "agents.yaml", "Path to agents.yaml")
 	cmd.Flags().StringVar(&agentsDir, "agents-dir", "", "Override agents directory")
-	cmd.Flags().StringVar(&dataDir, "data", config.DefaultDataDir(), "Data directory")
+	cmd.Flags().StringVar(&dataDir, "data-dir", config.DefaultDataDir(), "Data directory")
 	cmd.Flags().BoolVar(&debug, "debug", false, "Log full LLM requests/responses as JSONL")
 	cmd.Flags().BoolVar(&skipVerify, "skip-verify", false, "Skip agent manifest integrity verification")
-	cmd.Flags().BoolVar(&distributed, "distributed", false, "Run agents as separate OS processes with gRPC transport")
-	cmd.Flags().StringVar(&listenAddr, "listen", ":50050", "Conductor gRPC listen address (distributed mode)")
+	cmd.Flags().StringVar(&listenAddr, "listen", ":50050", "Conductor gRPC listen address for external-node mode")
+	cmd.Flags().StringVar(&advertiseAddr, "advertise", "", "Conductor gRPC advertise address for external-node mode")
+	cmd.Flags().StringVar(&controlPlaneAddress, "control-plane-address", "", "Reachable address of an external control-plane API")
+	cmd.Flags().BoolVar(&externalNodes, "external-nodes", false, "Run in external-node mode: the conductor hosts a gRPC server and agent instances run in external node hosts discovered through the control plane")
+	cmd.Flags().IntVar(&bootstrapNodes, "bootstrap-nodes", 0, "Automatically start N local external nodes when running in external-node mode without a configured control-plane API (default: 1)")
 	return cmd
 }
 
@@ -756,61 +960,153 @@ func promptNewProject(w io.Writer, readLine func() (string, bool), tty bool) (st
 
 func verifyCmd() *cobra.Command {
 	var (
-		agentsDir  string
-		regenerate bool
+		agentsDir    string
+		regenerate   bool
+		signingKey   string
+		generateKey  string
+		publicKeyOut string
 	)
 	cmd := &cobra.Command{
 		Use:   "verify",
-		Short: "Verify integrity of agent definition files",
+		Short: "Verify agent bundle integrity, signatures, and manifest state",
 		RunE: func(cmd *cobra.Command, args []string) error {
+			configPath := "agents.yaml"
 			if agentsDir == "" {
-				td, err := config.LoadFabricDef("agents.yaml")
+				td, err := config.LoadFabricDef(configPath)
 				if err == nil && td.AgentsDir != "" {
+					if err := config.ResolvePathsRelativeToConfig(td, configPath); err != nil {
+						return err
+					}
 					agentsDir = td.AgentsDir
 				} else {
 					agentsDir = "defaults/agents"
 				}
 			}
 
+			if generateKey != "" {
+				publicKey, privateKey, err := config.GenerateBundleKeyPair()
+				if err != nil {
+					return fmt.Errorf("generate bundle signing key: %w", err)
+				}
+				if err := config.WriteBundlePrivateKey(generateKey, privateKey); err != nil {
+					return fmt.Errorf("write private key: %w", err)
+				}
+				if publicKeyOut == "" {
+					publicKeyOut = generateKey + ".pub"
+				}
+				if err := config.WriteBundlePublicKey(publicKeyOut, publicKey); err != nil {
+					return fmt.Errorf("write public key: %w", err)
+				}
+				fmt.Printf("Bundle signing key written to %s\n", generateKey)
+				fmt.Printf("Bundle public key written to %s\n", publicKeyOut)
+				if !regenerate {
+					return nil
+				}
+				if signingKey == "" {
+					signingKey = generateKey
+				}
+			}
+
 			if regenerate {
-				manifest, err := config.GenerateManifest(agentsDir)
+				td, err := config.LoadFabricDef(configPath)
+				if err != nil {
+					return fmt.Errorf("load fabric definition: %w", err)
+				}
+				if err := config.ResolvePathsRelativeToConfig(td, configPath); err != nil {
+					return err
+				}
+				if agentsDir != "" {
+					td.AgentsDir = agentsDir
+					td.Agents = nil
+					if err := td.ResolveAgents(); err != nil {
+						return fmt.Errorf("resolve agents from %q: %w", agentsDir, err)
+					}
+				}
+
+				manifest, err := config.GenerateManifest(td.AgentsDir)
 				if err != nil {
 					return fmt.Errorf("generate manifest: %w", err)
 				}
-				manifestPath := config.ManifestPath(agentsDir)
+				manifestPath := config.ManifestPath(td.AgentsDir)
 				if err := config.WriteManifest(manifestPath, manifest); err != nil {
 					return fmt.Errorf("write manifest: %w", err)
 				}
+
+				bundle, err := config.GenerateSignedBundle(td)
+				if err != nil {
+					return fmt.Errorf("generate bundle: %w", err)
+				}
+				if signingKey != "" {
+					privateKey, err := config.LoadBundlePrivateKey(signingKey)
+					if err != nil {
+						return fmt.Errorf("load signing key: %w", err)
+					}
+					if err := config.SignBundle(bundle, privateKey); err != nil {
+						return fmt.Errorf("sign bundle: %w", err)
+					}
+				}
+				bundlePath := config.BundlePath(td.AgentsDir)
+				if err := config.WriteSignedBundle(bundlePath, bundle); err != nil {
+					return fmt.Errorf("write bundle: %w", err)
+				}
+
 				fmt.Printf("Manifest regenerated: %s (%d files)\n", manifestPath, len(manifest.Checksums))
+				fmt.Printf("Bundle written: %s\n", bundlePath)
+				if signingKey != "" {
+					fmt.Printf("Bundle signature: %s\n", "present")
+				} else {
+					fmt.Printf("Bundle signature: %s\n", "absent")
+				}
 				return nil
 			}
 
-			manifestPath := config.ManifestPath(agentsDir)
-			manifest, err := config.LoadManifest(manifestPath)
-			if err != nil {
-				return fmt.Errorf("load manifest: %w\nRun 'agentfab init' or 'agentfab verify --regenerate' to create one", err)
+			td, err := config.LoadFabricDef(configPath)
+			if err == nil {
+				if err := config.ResolvePathsRelativeToConfig(td, configPath); err != nil {
+					return err
+				}
+				if agentsDir != "" {
+					td.AgentsDir = agentsDir
+					td.Agents = nil
+					if err := td.ResolveAgents(); err != nil {
+						return fmt.Errorf("resolve agents from %q: %w", agentsDir, err)
+					}
+				}
+			}
+			if td == nil {
+				td = &config.FabricDef{
+					Fabric:    config.FabricMeta{Name: "local", Version: 1},
+					AgentsDir: agentsDir,
+				}
+				if err := td.ResolveAgents(); err != nil {
+					return fmt.Errorf("resolve agents: %w", err)
+				}
 			}
 
-			ok, mismatches, err := config.VerifyManifest(agentsDir, manifest)
+			result, err := config.VerifySignedBundle(td)
 			if err != nil {
 				return fmt.Errorf("verify: %w", err)
 			}
 
-			if ok {
-				fmt.Printf("PASS: all %d agent files match manifest checksums\n", len(manifest.Checksums))
-				return nil
+			bundlePath := config.BundlePath(td.AgentsDir)
+			if result.SignedBundleUsed {
+				fmt.Printf("PASS: signed bundle verified: %s\n", bundlePath)
+				if result.SignatureVerified {
+					fmt.Println("Signature verification: passed")
+				}
+			} else if result.ManifestVerified {
+				fmt.Printf("PASS: agent manifest verified: %s\n", config.ManifestPath(td.AgentsDir))
+			} else {
+				fmt.Println("PASS: bundle digests computed from local agent definitions")
 			}
-
-			fmt.Printf("FAIL: %d issue(s) detected:\n", len(mismatches))
-			for _, m := range mismatches {
-				fmt.Printf("  - %s\n", m)
-			}
-			fmt.Println("\nRun 'agentfab verify --regenerate' to update the manifest after intentional changes.")
-			return fmt.Errorf("integrity verification failed")
+			return nil
 		},
 	}
 	cmd.Flags().StringVar(&agentsDir, "agents-dir", "", "Agents directory (defaults to agents_dir from agents.yaml)")
-	cmd.Flags().BoolVar(&regenerate, "regenerate", false, "Regenerate manifest after intentional changes")
+	cmd.Flags().BoolVar(&regenerate, "regenerate", false, "Regenerate manifest and bundle metadata after intentional changes")
+	cmd.Flags().StringVar(&signingKey, "signing-key", "", "Path to an Ed25519 private key used to sign the bundle")
+	cmd.Flags().StringVar(&generateKey, "generate-key", "", "Generate a new Ed25519 private key at the given path")
+	cmd.Flags().StringVar(&publicKeyOut, "public-key-out", "", "Path to write the generated Ed25519 public key")
 	return cmd
 }
 
@@ -886,6 +1182,16 @@ func statusCmd() *cobra.Command {
 }
 
 func printStatus(ctx context.Context, c *conductor.Conductor) {
+	runtimeStatus := c.RuntimeStatus(ctx)
+	fmt.Printf(
+		"\nRuntime: %s\nControl plane: %s\nNodes: %d total (%d ready)\nInstances: %d total (%d ready)\n",
+		runtimeStatus.Mode,
+		statusValueOrUnknown(runtimeStatus.ControlPlaneAddress),
+		runtimeStatus.NodeCount,
+		runtimeStatus.ReadyNodeCount,
+		runtimeStatus.InstanceCount,
+		runtimeStatus.ReadyInstanceCount,
+	)
 	states := c.AgentStates(ctx)
 	fmt.Printf("\n%-15s %-30s %8s %8s %6s\n", "AGENT", "MODEL", "IN_TOK", "OUT_TOK", "CALLS")
 	fmt.Println(strings.Repeat("-", 75))
@@ -894,6 +1200,28 @@ func printStatus(ctx context.Context, c *conductor.Conductor) {
 			s.Name, s.Model, s.InputTokens, s.OutputTokens, s.TotalCalls)
 	}
 	fmt.Println()
+}
+
+func runtimeModeLabel(externalNodes bool) string {
+	if externalNodes {
+		return "External-Node Distributed"
+	}
+	return "Local"
+}
+
+func startupControlPlaneAddress(externalNodes bool, controlPlaneAddress string) string {
+	if !externalNodes {
+		return ""
+	}
+	return strings.TrimSpace(controlPlaneAddress)
+}
+
+func statusValueOrUnknown(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "n/a"
+	}
+	return value
 }
 
 func readStdin(scanner *bufio.Scanner) <-chan string {
@@ -1457,7 +1785,7 @@ func metricsCmd() *cobra.Command {
 			return nil
 		},
 	}
-	cmd.Flags().StringVar(&dataDir, "data", config.DefaultDataDir(), "Data directory")
+	cmd.Flags().StringVar(&dataDir, "data-dir", config.DefaultDataDir(), "Data directory")
 	cmd.Flags().BoolVar(&outputJSON, "json", false, "Output as JSON")
 	return cmd
 }

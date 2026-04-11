@@ -1,370 +1,311 @@
-# AgentFab Architecture
+# agentfab Architecture
+
+agentfab is a distributed orchestration platform for collaborative agent fabrics. This document describes the runtime architecture: the Conductor, the control plane, the data plane tiers, the node hosts that run agent instances, and the identity and recovery mechanisms that let the fabric run safely across process, machine, and cluster boundaries.
 
 ## Overview
 
-AgentFab is a multi-agent orchestration framework. You define a set of specialized agents — each with its own LLM, prompt, tools, and persistent knowledge — and the framework handles decomposition, scheduling, communication, and state management.
+A fabric is one agentfab execution domain. Inside a fabric:
 
-```
-┌──────────────────────────────────────────────────────────┐
-│  Fabric                                                  │
-│                                                          │
-│  ┌───────────┐              ┌───────────┐                │
-│  │ Conductor │◄────────────►│ Agent A   │                │
-│  │ (user I/O)│              └───────────┘                │
-│  └─────┬─────┘                                           │
-│        │                    ┌───────────┐                │
-│        └───────────────────►│ Agent B   │                │
-│                             └─────┬─────┘                │
-│                                   │                      │
-│                             ┌─────▼─────┐                │
-│                             │ Agent C   │                │
-│                             └───────────┘                │
-│                                                          │
-│  ┌──────────────────────────────────────────────────┐    │
-│  │ Shared Volume (logs, artifacts, definition file) │    │
-│  └──────────────────────────────────────────────────┘    │
-└──────────────────────────────────────────────────────────┘
-        ▲
-        │ text, images, files
-        ▼
-      User
+- the Conductor is the primary orchestration entry point. It screens user requests, decomposes them into task graphs, and drives them to completion.
+- specialist agents execute tasks, reviews, and tool workflows on their assigned model.
+- the control plane tracks nodes, agent instances, requests, tasks, and leases. It is durable across restarts.
+- storage is tiered into shared, agent, and scratch scopes so cross-agent artifacts, per-profile memory, and per-task scratch space each have their own cleanup and write-safety rules.
+
+```text
+User
+  |
+  v
+Conductor  ---> decomposition ---> Scheduler ---> control plane writes
+  |
+  +--> agent instances
+         - local goroutines   (local mode)
+         - external node hosts (external-node mode, including Kubernetes deployments)
 ```
 
-The Conductor is the only user-facing agent. It decomposes requests into task graphs and dispatches work to specialist agents. Agents communicate peer-to-peer — the Conductor orchestrates, it does not relay.
+## Core Concepts
 
-AgentFab ships with four default agents (conductor, architect, designer, developer) for software fabrication, but the framework is not limited to these roles. You define agents in YAML and the system adapts.
+### Fabric
 
----
+A fabric is one agentfab execution domain. It contains:
 
-## Agents
+- one active Conductor leader
+- zero or more standby Conductors
+- one or more logical agent profiles
+- zero or more concrete agent instances running those profiles
+- shared storage for artifacts and control-plane state
 
-### Definition
+### Conductor
 
-Every agent is defined in YAML:
+The Conductor is responsible for:
+
+- user interaction
+- request screening and disambiguation
+- task graph decomposition
+- scheduler lifecycle
+- request and task persistence
+- control-plane leadership
+- recovery and stale-work reconciliation on restart
+
+### Agent Profile Versus Agent Instance
+
+agentfab splits the concept of an agent into two:
+
+- `AgentProfile`: the logical role the scheduler targets, such as `developer` or `architect`. A profile is defined by its YAML configuration.
+- `AgentInstance`: one runnable execution unit for that profile on a specific node, registered in the control plane with its own endpoint and capacity.
+
+The scheduler dispatches work against profiles but places each task on a specific instance. Placement is least-loaded first, with per-request anti-affinity, so a fan-out workload is distributed across every eligible instance and no single instance collects the whole request. The control plane tracks instance lifecycle through registration, heartbeat, and recovery, so node loss does not kill the request in flight.
+
+### Node
+
+A node is a compute host that can register capacity and host one or more agent instances. External node hosts are started with `agentfab node serve` and register themselves with the control plane.
+
+## Runtime Modes
+
+agentfab supports:
+
+- local mode
+- external-node mode
+
+The exact behavior and commands are documented in [Runtime Modes](runtime-modes.md).
+
+## Agent Definitions
+
+Agents are defined in YAML. A definition describes:
+
+- name
+- purpose
+- capabilities
+- model
+- tools
+- escalation target
+- review behavior
+- verification rules
+- budgets and timeouts
+
+Representative example:
 
 ```yaml
-name: "data-analyst"
-purpose: "Analyze datasets and produce visualizations"
-capabilities: ["data_analysis", "chart_generation"]
-model: "anthropic/claude-sonnet-4-5-20250929"
+name: "developer"
+purpose: "Implement changes and validate them"
+capabilities: ["coding", "testing"]
+model: "anthropic/claude-sonnet-4-6"
 escalation_target: "architect"
 tools:
-  - name: python
-    command: "python3 $ARGS"
+  - name: go-test
+    command: "go test ./..."
     mode: live
-review_guidelines: "Check statistical validity and chart labeling"
+verify:
+  command: "cd $SCRATCH_DIR && go test ./..."
+  max_retries: 2
 budget:
   max_total_tokens: 500000
-  max_cost_usd: 2.00
-verify:
-  command: "cd $SCRATCH_DIR && python3 -m py_compile *.py 2>&1"
-  max_retries: 2
-  bonus_iterations: 5
+  max_cost_usd: 5.00
 ```
 
-Key fields:
+An agent definition describes the native agentfab implementation path. A logical profile is the scheduler-facing identity of an agent role; the implementation below it is what runs the agent's prompt, tools, and loop.
 
-| Field | Description |
-|---|---|
-| `name` | Unique identifier. Lowercase, alphanumeric + hyphens. |
-| `purpose` | Injected into the agent's system prompt. |
-| `model` | `provider/model-id` format. Each agent can use a different LLM. |
-| `capabilities` | Tool/action identifiers. Used by the Conductor to match tasks to agents. |
-| `tools` | Shell commands the LLM can invoke. Modes: `live`, `post_process`, `both`. |
-| `escalation_target` | Where to defer on uncertainty. |
-| `review_guidelines` | What this agent checks when reviewing peers. |
-| `review_prompt` | Custom prompt override for when this agent reviews peers. |
-| `verify` | Post-loop verification command. See [Verification Gates](#verification-gates). |
-| `special_knowledge_file` | Markdown file loaded into context on every invocation. |
-| `max_concurrent_tasks` | Concurrency limit for this agent. 0 = unlimited. |
-| `budget` | Token and cost limits: `max_input_tokens`, `max_output_tokens`, `max_total_tokens`, `max_cost_usd`. |
-| `task_timeout` | Maximum duration for a single task execution. |
-| `max_knowledge_nodes` | Cap on active knowledge graph nodes. Default 200. |
-| `curation_threshold` | Node count that triggers LLM-based graph consolidation. Default 50. |
-| `cold_storage_retention_days` | Days before permanently purging cold-stored nodes. Default 1095 (3 years). |
-| `model_tiers` | Ordered list of models for adaptive routing (e.g., try cheaper model first). |
-| `shell_only` | If true, the agent edits files via shell commands only, with no file artifacts. |
-| `address` | gRPC address for distributed mode. |
+## Request Lifecycle
 
-### LLM Providers
+When the user submits a request:
 
-Four provider adapters via [Eino](https://github.com/cloudwego/eino):
+1. The Conductor evaluates whether the request is actionable.
+2. If needed, the Conductor asks clarifying questions.
+3. The Conductor decomposes the request into a task DAG.
+4. The scheduler executes ready tasks subject to dependency ordering and per-profile concurrency limits.
+5. Tasks may run bounded review loops.
+6. Request and task state are persisted through the control plane.
+7. Results, artifacts, and knowledge updates are written to storage.
 
-| Adapter | Covers |
-|---|---|
-| Anthropic | Claude (Opus, Sonnet, Haiku) |
-| OpenAI | GPT, o-series |
-| Google | Gemini |
-| OpenAI-compatible | Any provider with the OpenAI chat completions API (Groq, Together, Ollama, etc.) |
-
-Model format: `provider/model-id` (e.g., `anthropic/claude-opus-4-5-20251101`, `openai/gpt-5.2`, `google/gemini-3.1-pro-preview`). Swap a model by changing one line in the YAML.
-
-### Default Profiles
-
-`agentfab init` creates a system with four built-in agents:
-
-| Profile | Role | Default Model |
-|---|---|---|
-| `conductor` | Orchestration, user I/O | Claude Sonnet |
-| `architect` | Technical authority, design decisions | GPT-5.2 |
-| `designer` | UI/UX design, visual review | Claude Haiku |
-| `developer` | Code generation, testing | Claude Opus |
-
-These are starting points. Override models, add agents, remove agents, or replace all of them.
-
-### Custom Agents
-
-`agentfab agent compile` generates YAML agent definitions from plain Markdown descriptions:
-
-1. Write one `.md` file per agent in a directory (e.g., `./agents/`). Each filename becomes the agent name.
-2. Run `agentfab agent compile --input ./agents/ --output ./agents/`.
-3. The compiler reads each `.md`, generates a structured YAML definition (capabilities, tools, escalation targets), copies the `.md` as a special knowledge file, writes `agents.yaml`, and generates a manifest.
-
-A conductor agent is auto-added if not present in the input. Use `--dry-run` to preview generated definitions without writing files.
-
----
+Implementation details live in [Orchestration Internals](orchestration-internals.md).
 
 ## Task Graphs
 
-The Conductor decomposes user requests into a DAG of tasks. Each task is assigned to an agent, has dependencies, and can optionally participate in a review loop.
+The Conductor decomposes requests into DAGs of `TaskNode`s.
 
-```
-User: "Build a REST API with authentication and a dashboard"
+Each task carries:
 
-┌──────────────────┐
-│ T1: Design auth  │
-│ (agent: arch)    │
-└────────┬─────────┘
-    ┌────┴────┐
-    ▼         ▼
-┌────────┐ ┌────────────┐
-│ T2:    │ │ T3: Design │
-│ Review │ │ dashboard  │
-│ (loop) │ │ (agent: B) │
-└────┬───┘ └──────┬─────┘
-     │            │
-     ▼            ▼
-  ┌──────────────────┐
-  │ T4: Implement    │
-  │ (agent: dev)     │
-  └──────────────────┘
-```
+- a task ID
+- a logical target profile
+- an optional assigned instance
+- an optional execution node
+- dependency edges
+- status and lease metadata
 
-### Decomposition
+Scheduler properties:
 
-The Conductor uses LLM-driven structured decomposition:
-1. Parse the request into discrete outcomes.
-2. Match each outcome to an agent from the definition file.
-3. Determine dependencies.
-4. Annotate tasks needing iteration with orchestration loops.
-5. Assign timeouts and budgets.
-
-**Templates** (`defaults/templates/`) provide starting-point patterns (e.g., `build-app`, `fix-bug`, `design-change`). The LLM adapts these rather than generating graphs from scratch.
-
-**Fast path**: Trivial requests skip decomposition entirely — a synthetic single-task graph is created.
-
-**Disambiguation**: Before decomposition, the Conductor evaluates whether the request is clear enough. Ambiguous requests get a clarifying question before proceeding.
-
-### Scheduling
-
-The scheduler executes the DAG:
-- Tasks run in parallel when dependencies allow.
-- Per-agent concurrency limits are enforced.
-- Failed tasks cascade: dependents are marked failed via BFS.
-- Deadlock detection catches circular or stuck graphs.
-
-During execution, users can **pause**, **resume**, **cancel**, or **amend** tasks. Amendments can trigger graph restructuring — completed work is preserved and new tasks are added.
-
----
+- ready tasks run in parallel when dependencies allow
+- per-agent concurrency limits are enforced
+- failed tasks cascade failure to dependents
+- task metadata represents profile-aware and instance-aware execution
 
 ## Orchestration Loops
 
-When a task needs iteration between agents (e.g., implement → review → revise), it runs as a bounded FSM.
+Review and revise flows are modeled as bounded finite state machines.
 
-```
-     max_transitions = 5
-     ┌──────────────────────────────┐
-     │                              │
-     ▼                              │
-┌─────────┐    ┌──────────┐    ┌────┴────┐
-│ WORKING │───►│ REVIEWING│───►│ REVISING│
-│(agent A)│    │(agent B) │    │(agent A)│
-└─────────┘    └────┬─────┘    └─────────┘
-                    │
-                    ▼
-              ┌──────────┐
-              │ APPROVED │  (terminal)
-              └──────────┘
+Properties:
 
-  If max_transitions exceeded:
-              ┌──────────┐
-              │ ESCALATED│  (terminal → user)
-              └──────────┘
-```
+- explicit states and transitions
+- hard `max_transitions` cap
+- tool-less approvals are downgraded during review
+- terminal states include approved and escalated outcomes
 
-**Key properties:**
-- Every loop has a hard `max_transitions` cap. Infinite loops are structurally impossible.
-- Agents route directly within loops — the Conductor only sees the initial dispatch and terminal result.
-- `ESCALATED` is a graceful outcome, not an error. The Conductor presents the impasse to the user.
-- Reviewers must use tools before approving (zero-tool approvals are downgraded to "revise").
-- Task scope controls iteration depth: `small` (no loop), `standard` (max 3), `large` (max 5).
+This is one of the core architectural differences between agentfab and frameworks that rely on ad hoc recursive prompting.
 
-See [orchestration-internals.md](orchestration-internals.md) for the full FSM implementation.
+## Control Plane
 
----
+agentfab now has an explicit control-plane layer.
 
-## Knowledge System
+The core records are:
 
-Each agent maintains a persistent knowledge graph on disk. After every request, the system extracts knowledge from task results and merges it into the graph.
+- `Node`
+- `AgentInstance`
+- `LeaderLease`
+- `TaskLease`
+- `RequestRecord`
+- `TaskRecord`
 
-### What gets stored
+Current control-plane responsibilities:
 
-Knowledge nodes with provenance metadata:
+- conductor leadership
+- node registration and heartbeat
+- instance registration and heartbeat
+- request persistence
+- task persistence
+- task lease tracking
 
-| Field | Description |
-|---|---|
-| `confidence` | 0–1, LLM-assigned. Only raised on merge, never lowered. |
-| `source` | `task_result`, `inferred`, or `user_provided`. |
-| `ttl_days` | Days until stale. 0 = never expires. |
-| `hits` / `last_hit_at` | Access frequency tracking. Drives cold storage eviction. |
-| `tags` | Including `decision` for project-wide constraints. |
+Current backends:
 
-Edges connect nodes: `depends_on`, `implements`, `related_to`, `supersedes`.
+- in-memory store
+- file-backed durable store
+- etcd-backed consensus store
 
-### Context injection
+The file-backed store is appropriate for:
 
-Before each task, relevant knowledge is injected into the agent's context:
-- BFS traversal from the agent's own nodes, scored by depth + keyword overlap + confidence. Capped at 15 nodes.
-- **Decision injection**: Decision-tagged nodes are scored by keyword relevance against the current task or request. Only decisions above a relevance threshold are injected. This keeps project-wide constraints available without flooding unrelated tasks with irrelevant context.
+- local development
+- shared-volume testing of external-node mode
 
-### Lifecycle
+The etcd-backed store is appropriate for:
 
-Knowledge nodes move through three tiers:
+- multi-node distributed execution
+- resilient Conductor leadership
+- hybrid-cloud deployments that need consensus-backed metadata and lease coordination
 
-```
-Active graph  →  Cold storage  →  Permanent purge
-(frequently       (hits < 3,        (older than
- accessed)         30+ days old)     3 years)
-```
+This gives agentfab a real production-grade metadata-plane option now, while leaving room for future backend expansion.
 
-- **Cold storage**: Infrequently accessed nodes are archived. Decision-tagged nodes are exempt.
-- **Curation**: When the graph exceeds 50 nodes, LLM-based consolidation merges overlapping nodes. Validation ensures decisions and high-confidence nodes are preserved. Removed nodes go to cold storage, not deletion.
-- **Supersession**: When decisions evolve, a `supersedes` edge retires the old decision. Superseded nodes are excluded from lookups.
+## Recovery Model
 
----
+On startup, the Conductor:
 
-## Storage
+- registers as a control-plane node
+- acquires the leader lease
+- reconciles stale requests from prior runs
 
-Three tiers, scoped by visibility and lifetime:
+Recovery semantics:
 
-| Tier | Scope | Lifetime | Contents |
-|---|---|---|---|
-| Shared | All agents | Persistent | Logs, artifacts, definition file |
-| Agent | One agent | Persistent | Knowledge graph, special knowledge file, cold storage |
-| Scratch | One agent | Ephemeral | Script execution temp files |
+- requests still marked running are moved to `interrupted`
+- active tasks are marked interrupted
+- stale task leases are released
+- stale node and instance heartbeats become `unavailable`
+- tasks and loop executions are redispatched after active replica loss when another healthy instance is available
 
-```
-Shared Volume
-├── agents.yaml                    (definition file)
-├── logs/{request_id}.jsonl        (interaction logs)
-└── artifacts/{agent}/             (produced files)
+## Identity And Security
 
-Agent Volume (per agent)
-├── special_knowledge.md           (user-managed, read-only to agent)
-├── knowledge/graph.json           (persistent knowledge graph)
-├── cold_storage/                  (archived nodes)
-└── docs/                          (knowledge node documents)
+Distributed communication uses a platform-neutral identity layer.
 
-Scratch (ephemeral)
-└── /tmp/agent-xxx/                (destroyed after task)
-```
+Security model:
 
-`Delete` is only permitted on Scratch. Agent and Shared tiers block programmatic deletion.
+- local and distributed traffic use a shared development certificate provider or a mounted external provider
+- external nodes require authenticated enrollment using join tokens
+- distributed workload traffic uses mTLS
+- bootstrap identity and workload identity are separate concepts in the design
 
-### Deployment modes
-
-| Tier | Local | Docker | Kubernetes |
-|---|---|---|---|
-| Shared | `{data-dir}/shared/` | Named volume | PVC (ReadWriteMany) |
-| Agent | `{data-dir}/agents/{name}/` | Volume per agent | PVC per agent |
-| Scratch | OS `$TMPDIR` | tmpfs | `emptyDir` |
-
----
-
-## Sandboxing
-
-All tool and script execution runs through `sandbox.Run`:
-
-**Environment isolation**: Stripped env (`PATH=/usr/bin:/bin`), isolated `HOME` and `TMPDIR`, no API keys or credentials leaked.
-
-**OS-level filesystem restrictions**:
-- **macOS**: `sandbox-exec` with deny-default SBPL profile. Read-only access to system paths and detected toolchains. Read-write access to the work directory only. Note: `sandbox-exec` is deprecated by Apple; see [tech-debt.md](tech-debt.md) for migration plans.
-- **Linux**: Landlock filesystem restrictions (kernel >= 5.13). Enforced via a self-reexec pattern: the binary re-invokes itself with a sentinel argument, applies Landlock to the child process, then `exec`s the real command under the restricted policy. On older kernels without Landlock support, a warning is logged and execution proceeds unsandboxed.
-- Toolchain auto-detection (NVM, Pyenv, Rustup, Go, Bun, etc.) adds development tool paths as read-only.
-
-**Timeout enforcement**: Hard kill via process group signal on timeout.
-
-**Write scoping**: Agents can only write to `artifacts/{own-name}/` on the shared volume, enforced at the Storage interface level.
-
----
-
-## Verification Gates
-
-Agents can define a `verify` block to run a command after the tool loop ends:
-
-```yaml
-verify:
-  command: "cd $SCRATCH_DIR && npm run build 2>&1"
-  max_retries: 2
-  bonus_iterations: 5
-  timeout: 120s
-```
-
-On failure, errors are injected back into the conversation and the agent gets extra iterations to fix them. After exhausting retries, a `VERIFICATION FAILED` header is prepended to the response for upstream visibility.
-
----
-
-## Escalation
-
-Each agent has an `escalation_target`. When an agent cannot produce a confident answer, it escalates rather than guessing.
-
-```
-Agent A ──► Agent B ──► Conductor ──► User
-```
-
-The chain is configurable per agent. The Conductor always escalates to the user.
-
----
+See [Identity Architecture](identity-architecture.md) for the full subject model and provider contract, and [Production Identity Deployment](production-identity-deployment.md) for the current external-provider path.
 
 ## Communication
 
-- **Local mode**: In-process Go channels via `local.Hub`. Each agent has a buffered channel (cap 64). `Send()` drops a `*message.Message` onto the target agent's channel; `Receive()` returns the agent's own inbound channel. No network I/O, no serialization overhead.
-- **Distributed mode**: Each agent runs as a standalone gRPC server (`agentfab agent serve`). Communication uses protobuf over gRPC with mTLS. The conductor generates a CA and per-agent certificates at startup. Agent discovery uses a static peers file written by the conductor after all agents are up. A cluster monitor detects dead members and can trigger conductor re-election.
-- **Messages**: Multipart format with `TextPart`, `FilePart` (URI to shared volume), and `DataPart` (structured JSON).
-- **Logging**: All messages are logged to `logs/{request_id}.jsonl` on the shared volume.
+The two runtime modes differ in how agents find each other, how identity is issued, and how failures are detected and handled. Each mode is described separately below.
 
----
+### Local Mode
 
-## Cost Control
+Everything runs in one process. The communicator is an in-process hub, messages travel over Go channels, and discovery is a local registry populated at startup. There is no network transport, no TLS, and no liveness checking. A crash in any agent crashes the host process.
 
-**Metering**: Every LLM call records input/output tokens, duration, and cost. Aggregated per agent, per task, and per request.
+### External-Node Mode
 
-**Budgets**: Per-agent limits on input tokens, output tokens, total tokens, and cost (USD). Checked before every LLM call; on breach, the agent stops and sends a failed result.
+The conductor, the control-plane service, and one or more node hosts run as separate processes that can live on separate machines. Node hosts are started with `agentfab node serve` and register themselves with the control plane after presenting an enrollment token and measured claims. The control-plane service can either be embedded in the conductor for fast local testing or run as a standalone process via `agentfab control-plane serve`, backed by a file store or an etcd cluster.
 
-**Circuit breakers**: Budget exceeded, consecutive errors, nonsensical output, or timeout. All trigger escalation.
+All traffic uses gRPC with mTLS. Identity comes from the shared local-development provider for development work or from a mounted external provider for production, such as SPIFFE or SPIRE. `ManagedCertificate` rotation applies in both cases, so long-running node hosts and conductors reissue their leaf certificates before expiry without operator intervention.
 
-**Metrics**: `agentfab metrics` produces per-agent and per-model cost reports from debug logs.
+Discovery is control-plane-backed. Instance endpoints resolve through the control plane's instance registry, which node hosts update as they bring up the agent instances they host. There is no peers file in this mode.
 
----
+Liveness is also control-plane-backed. Node hosts and hosted instances heartbeat through the control plane, and the control plane marks records unavailable once heartbeats expire. The scheduler reacts by redispatching affected tasks to another eligible instance, with task leases preventing duplicate execution across the recovery boundary.
 
-## Integrity
+Conductor leadership is managed through a durable leader lease in the control plane, and a standby conductor can take over when an incumbent's lease expires.
 
-`agentfab init` generates a manifest (`agents/manifest.json`) with SHA-256 checksums of all agent definition files. On startup, `agentfab run` verifies the manifest and reports any modifications, additions, or deletions. `agentfab verify` runs this check standalone.
+## Storage
 
----
+agentfab uses three storage tiers:
+
+| Tier | Scope | Lifetime | Typical contents |
+|---|---|---|---|
+| Shared | Fabric-wide | Persistent | artifacts, logs, cross-agent handoff, `agents.yaml` |
+| Agent | Per profile | Persistent | knowledge graph, special knowledge, cold storage |
+| Scratch | Per task | Ephemeral | working files, tool outputs |
+
+Each tier has its own cleanup rules. Scratch can be wiped without consequence. The per-agent tier can be wiped to reset one profile's accumulated memory without touching cross-agent artifacts. The shared tier is the one the fabric treats as ground truth when agents hand work off to each other.
+
+When many parallel instances of the same profile write concurrently, they write to task-scoped paths under the shared tier. Each task writes to a unique path, so concurrent writers do not collide. Cross-profile shared state that needs coordination, such as the merged knowledge graph, is written in one place by the Conductor in a single background pass, not by each agent in parallel.
+
+Two other properties of the storage layer are worth knowing:
+
+- Tier roots are configurable, so deployment clients can back them with mounted cloud volumes (EBS, CSI, `hostPath`) without touching core runtime code.
+- The runtime materializes local workspaces from the storage abstraction for tools and sandboxed execution. The backend does not have to be a POSIX filesystem. An object store or a service-backed storage implementation plugs into the same contract as long as it can produce a staged local workspace on demand.
+
+## Knowledge System
+
+Each agent keeps a persistent knowledge graph.
+
+The system supports:
+
+- confidence-scored nodes
+- typed edges such as `depends_on` and `supersedes`
+- decision injection into future tasks
+- cold storage for stale knowledge
+- graph curation when the active graph grows too large
+
+The goal is to preserve durable architectural context, not just retrieve old transcripts.
+
+## Verification And Budgeting
+
+Agents can define:
+
+- verification commands
+- retry counts
+- timeout limits
+- token budgets
+- cost budgets
+
+The runtime meters LLM usage and can stop work when budgets are exceeded.
+
+## Sandboxing
+
+Tool execution runs inside the sandbox layer.
+
+Current model:
+
+- stripped environment
+- write restrictions
+- timeout enforcement
+- OS-specific filesystem controls
+
+Platform behavior:
+
+- macOS: `sandbox-exec`
+- Linux: Landlock where supported
 
 ## Further Reading
 
-- [Orchestration Internals](orchestration-internals.md) — code-level request lifecycle, scheduler implementation, FSM routing details
-- [Glossary](glossary.md) — terminology reference
-- [Tech Debt](tech-debt.md) — known gaps
+- [Runtime Modes](runtime-modes.md)
+- [Orchestration Internals](orchestration-internals.md)
+- [Identity Architecture](identity-architecture.md)
+- [Roadmap](roadmap.md)
+- [Glossary](glossary.md)

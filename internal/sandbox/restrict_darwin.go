@@ -19,10 +19,10 @@ var (
 // that restricts filesystem access to the paths specified in the policy.
 //
 // sandbox-exec is deprecated by Apple but remains functional. A warning is
-// logged on first use. See TD-006 in docs/tech-debt.md.
+// logged on first use.
 func restrict(cfg Config, policy Policy, name string, args []string) (string, []string) {
 	darwinWarnOnce.Do(func() {
-		slog.Warn("using macOS sandbox-exec (deprecated by Apple, see TD-006)")
+		slog.Warn("using macOS sandbox-exec (deprecated by Apple)")
 	})
 
 	profile := buildSBPL(cfg, policy)

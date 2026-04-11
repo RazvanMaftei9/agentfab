@@ -38,6 +38,14 @@ func InitProject(name, dir string) (string, error) {
 	if err := WriteManifest(ManifestPath(agentsDir), manifest); err != nil {
 		return "", fmt.Errorf("write manifest: %w", err)
 	}
+	td.AgentsDir = agentsDir
+	bundle, err := GenerateSignedBundle(td)
+	if err != nil {
+		return "", fmt.Errorf("generate bundle: %w", err)
+	}
+	if err := WriteSignedBundle(BundlePath(agentsDir), bundle); err != nil {
+		return "", fmt.Errorf("write bundle: %w", err)
+	}
 
 	return configPath, nil
 }
@@ -81,6 +89,14 @@ func InitProjectCustom(name, dir, mdDir, defaultModel string) (string, error) {
 	}
 	if err := WriteManifest(ManifestPath(agentsDir), manifest); err != nil {
 		return "", fmt.Errorf("write manifest: %w", err)
+	}
+	td.AgentsDir = agentsDir
+	bundle, err := GenerateSignedBundle(td)
+	if err != nil {
+		return "", fmt.Errorf("generate bundle: %w", err)
+	}
+	if err := WriteSignedBundle(BundlePath(agentsDir), bundle); err != nil {
+		return "", fmt.Errorf("write bundle: %w", err)
 	}
 
 	return configPath, nil

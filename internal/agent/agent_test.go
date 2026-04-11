@@ -1121,6 +1121,17 @@ func TestCompleteLoopStepForwardsToNextAgent(t *testing.T) {
 		LoopID:       "review-1",
 		CurrentState: "WORKING",
 	}, "Implement login")
+	lc, ok := loop.DecodeContext(loopMsg)
+	if !ok {
+		t.Fatal("missing loop context in test message")
+	}
+	lc.AssignedInstances = map[string]string{
+		"architect": "node-b/architect/1",
+	}
+	lc.ExecutionNodes = map[string]string{
+		"architect": "node-b",
+	}
+	loopMsg.Parts[1] = loop.EncodeContext(lc)
 	conductorComm.Send(ctx, loopMsg)
 
 	// Developer should forward to architect (REVIEWING state), not back to conductor.
@@ -1135,6 +1146,12 @@ func TestCompleteLoopStepForwardsToNextAgent(t *testing.T) {
 		if msg.To != "architect" {
 			t.Errorf("to: got %q, want architect", msg.To)
 		}
+		if msg.Metadata["assigned_instance"] != "node-b/architect/1" {
+			t.Errorf("assigned instance: got %q, want node-b/architect/1", msg.Metadata["assigned_instance"])
+		}
+		if msg.Metadata["execution_node"] != "node-b" {
+			t.Errorf("execution node: got %q, want node-b", msg.Metadata["execution_node"])
+		}
 		// Verify loop context is forwarded.
 		lc, ok := loop.DecodeContext(msg)
 		if !ok {
@@ -1145,6 +1162,99 @@ func TestCompleteLoopStepForwardsToNextAgent(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("timeout waiting for forwarded message to architect")
+	}
+}
+
+func TestLoopTaskSendsStatusUpdateToConductor(t *testing.T) {
+	hub := local.NewHub()
+	conductorComm := hub.Register("conductor")
+	devComm := hub.Register("developer")
+	_ = hub.Register("architect")
+
+	events := event.NewBus()
+	defer events.Close()
+
+	ag := &Agent{
+		Def: runtime.AgentDefinition{
+			Name:    "developer",
+			Purpose: "Code generation",
+			Model:   "anthropic/claude-opus-4",
+		},
+		Comm:         devComm,
+		Generate:     mockGenerate("login implementation code"),
+		SystemPrompt: "You are a developer.",
+		Events:       events,
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go ag.Run(ctx)
+
+	loopDef := testLoopDef()
+	loopMsg := buildLoopMessage("conductor", "developer", loopDef, loop.LoopState{
+		LoopID:       "review-1",
+		CurrentState: "WORKING",
+	}, "Implement login")
+	lc, ok := loop.DecodeContext(loopMsg)
+	if !ok {
+		t.Fatal("missing loop context in test message")
+	}
+	lc.DispatchNonce = "nonce-1"
+	loopMsg.Parts[1] = loop.EncodeContext(lc)
+	loopMsg.Metadata["assigned_instance"] = "node-a/developer/1"
+	loopMsg.Metadata["execution_node"] = "node-a"
+	conductorComm.Send(ctx, loopMsg)
+
+	var sawStatus bool
+	timeout := time.After(5 * time.Second)
+	for !sawStatus {
+		select {
+		case msg := <-conductorComm.Receive(ctx):
+			if msg.Type != message.TypeStatusUpdate {
+				continue
+			}
+			sawStatus = true
+			if msg.Metadata["task_id"] != "t1" {
+				t.Fatalf("task_id = %q, want t1", msg.Metadata["task_id"])
+			}
+			if msg.Metadata["loop_id"] != "review-1" {
+				t.Fatalf("loop_id = %q, want review-1", msg.Metadata["loop_id"])
+			}
+			if msg.Metadata["assigned_instance"] != "node-a/developer/1" {
+				t.Fatalf("assigned instance = %q, want node-a/developer/1", msg.Metadata["assigned_instance"])
+			}
+			if msg.Metadata["execution_node"] != "node-a" {
+				t.Fatalf("execution node = %q, want node-a", msg.Metadata["execution_node"])
+			}
+			if msg.Metadata["dispatch_nonce"] != "nonce-1" {
+				t.Fatalf("dispatch nonce = %q, want nonce-1", msg.Metadata["dispatch_nonce"])
+			}
+		case <-timeout:
+			t.Fatal("timeout waiting for loop status update")
+		}
+	}
+}
+
+func waitForConductorTaskResult(t *testing.T, ch <-chan *message.Message, timeout time.Duration) *message.Message {
+	t.Helper()
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	for {
+		select {
+		case msg := <-ch:
+			if msg == nil {
+				t.Fatal("received nil conductor message")
+			}
+			if msg.Type == message.TypeStatusUpdate {
+				continue
+			}
+			return msg
+		case <-timer.C:
+			t.Fatal("timeout waiting for conductor task result")
+		}
 	}
 }
 
@@ -1185,19 +1295,15 @@ func TestCompleteLoopStepTerminalSendsToConductor(t *testing.T) {
 	conductorComm.Send(ctx, loopMsg)
 
 	// Architect approves → terminal state → result goes to conductor.
-	select {
-	case msg := <-conductorComm.Receive(ctx):
-		if msg.Type != message.TypeTaskResult {
-			t.Errorf("expected task_result, got %s", msg.Type)
-		}
-		if msg.From != "architect" {
-			t.Errorf("from: got %q", msg.From)
-		}
-		if msg.To != "conductor" {
-			t.Errorf("to: got %q, want conductor", msg.To)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("timeout waiting for terminal result to conductor")
+	msg := waitForConductorTaskResult(t, conductorComm.Receive(ctx), 5*time.Second)
+	if msg.Type != message.TypeTaskResult {
+		t.Errorf("expected task_result, got %s", msg.Type)
+	}
+	if msg.From != "architect" {
+		t.Errorf("from: got %q", msg.From)
+	}
+	if msg.To != "conductor" {
+		t.Errorf("to: got %q, want conductor", msg.To)
 	}
 }
 
@@ -1338,16 +1444,12 @@ func TestCompleteLoopStepApprovedWithFileEvidenceStaysApproved(t *testing.T) {
 	)
 	conductorComm.Send(ctx, loopMsg)
 
-	select {
-	case msg := <-conductorComm.Receive(ctx):
-		if msg.Type != message.TypeTaskResult {
-			t.Fatalf("expected task_result to conductor, got %s", msg.Type)
-		}
-		if msg.To != "conductor" {
-			t.Fatalf("expected result to conductor, got %q", msg.To)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("timeout waiting for terminal approval")
+	msg := waitForConductorTaskResult(t, conductorComm.Receive(ctx), 5*time.Second)
+	if msg.Type != message.TypeTaskResult {
+		t.Fatalf("expected task_result to conductor, got %s", msg.Type)
+	}
+	if msg.To != "conductor" {
+		t.Fatalf("expected result to conductor, got %q", msg.To)
 	}
 }
 
@@ -1388,16 +1490,70 @@ func TestCompleteLoopStepMaxTransitionsEscalates(t *testing.T) {
 	conductorComm.Send(ctx, loopMsg)
 
 	// Should escalate back to conductor.
+	msg := waitForConductorTaskResult(t, conductorComm.Receive(ctx), 5*time.Second)
+	if msg.Type != message.TypeTaskResult {
+		t.Errorf("expected task_result, got %s", msg.Type)
+	}
+	if msg.Metadata["loop_escalated"] != "true" {
+		t.Error("expected loop_escalated metadata")
+	}
+}
+
+func TestLoopReviewFailureReturnsTerminalResultToConductor(t *testing.T) {
+	hub := local.NewHub()
+	conductorComm := hub.Register("conductor")
+	devComm := hub.Register("developer")
+	archComm := hub.Register("architect")
+	_ = devComm
+
+	events := event.NewBus()
+	defer events.Close()
+
+	ag := &Agent{
+		Def: runtime.AgentDefinition{
+			Name:    "architect",
+			Purpose: "System design",
+			Model:   "anthropic/claude-opus-4",
+		},
+		Comm: archComm,
+		Generate: func(context.Context, []*schema.Message) (*schema.Message, error) {
+			return nil, fmt.Errorf("tool loop did not converge after 20 iterations")
+		},
+		SystemPrompt: "You are an architect.",
+		Events:       events,
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go ag.Run(ctx)
+
+	loopDef := testLoopDef()
+	loopMsg := buildLoopMessage("developer", "architect", loopDef, loop.LoopState{
+		LoopID:       "review-1",
+		CurrentState: "REVIEWING",
+	}, "Implement login")
+	loopMsg.Type = message.TypeReviewRequest
+	conductorComm.Send(ctx, loopMsg)
+
+	msg := waitForConductorTaskResult(t, conductorComm.Receive(ctx), 5*time.Second)
+	if msg.Type != message.TypeTaskResult {
+		t.Fatalf("expected task_result to conductor, got %s", msg.Type)
+	}
+	if msg.To != "conductor" {
+		t.Fatalf("expected result to conductor, got %q", msg.To)
+	}
+	if msg.Metadata["status"] != "failed" {
+		t.Fatalf("status: got %q, want failed", msg.Metadata["status"])
+	}
+	if got := extractText(msg); !strings.Contains(got, "tool loop did not converge after 20 iterations") {
+		t.Fatalf("unexpected loop failure result: %q", got)
+	}
+
 	select {
-	case msg := <-conductorComm.Receive(ctx):
-		if msg.Type != message.TypeTaskResult {
-			t.Errorf("expected task_result, got %s", msg.Type)
-		}
-		if msg.Metadata["loop_escalated"] != "true" {
-			t.Error("expected loop_escalated metadata")
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("timeout waiting for escalation result")
+	case unexpected := <-devComm.Receive(ctx):
+		t.Fatalf("unexpected message routed back to previous loop participant: %s", unexpected.Type)
+	case <-time.After(200 * time.Millisecond):
 	}
 }
 
@@ -1455,20 +1611,15 @@ func TestCompleteLoopStepRevisionCycle(t *testing.T) {
 	// 2. architect → developer (REVISING) → architect (REVIEWING) → approved
 	// 3. architect → conductor (terminal)
 
-	select {
-	case msg := <-conductorComm.Receive(ctx):
-		if msg.Type != message.TypeTaskResult {
-			t.Errorf("expected task_result, got %s", msg.Type)
-		}
-		if msg.To != "conductor" {
-			t.Errorf("to: got %q, want conductor", msg.To)
-		}
-		// The final message should come from architect (who approved).
-		if msg.From != "architect" {
-			t.Errorf("from: got %q, want architect", msg.From)
-		}
-	case <-ctx.Done():
-		t.Fatal("timeout waiting for full revision cycle to complete")
+	msg := waitForConductorTaskResult(t, conductorComm.Receive(ctx), 5*time.Second)
+	if msg.Type != message.TypeTaskResult {
+		t.Errorf("expected task_result, got %s", msg.Type)
+	}
+	if msg.To != "conductor" {
+		t.Errorf("to: got %q, want conductor", msg.To)
+	}
+	if msg.From != "architect" {
+		t.Errorf("from: got %q, want architect", msg.From)
 	}
 }
 
@@ -3290,9 +3441,9 @@ func TestExecuteTaskMaterializesBlocksToScratch(t *testing.T) {
 
 func TestStripUserQueryLines(t *testing.T) {
 	tests := []struct {
-		name    string
-		input   string
-		want    string
+		name  string
+		input string
+		want  string
 	}{
 		{
 			name:  "no ASK_USER lines",
@@ -3818,7 +3969,7 @@ func TestPopulateScratchSkipsExisting(t *testing.T) {
 	os.WriteFile(filepath.Join(scratchDir, "main.go"), []byte("scratch version"), 0644)
 
 	ag := &Agent{
-		Def: runtime.AgentDefinition{Name: "developer"},
+		Def:     runtime.AgentDefinition{Name: "developer"},
 		Storage: storage,
 		ToolExecutor: &ToolExecutor{
 			TierPaths: []string{scratchDir, t.TempDir(), storage.SharedDir()},
@@ -3877,12 +4028,12 @@ func TestPersistScratchToShared(t *testing.T) {
 
 	// Create files in scratch that simulate shell-created project files.
 	scratchFiles := map[string]string{
-		"package.json":       `{"name": "todo-app"}`,
-		"tsconfig.json":      `{"compilerOptions": {}}`,
-		"vite.config.ts":     `export default {}`,
-		"src/App.tsx":        `export default function App() {}`, // this one will be in file blocks
-		"src/main.tsx":       `import App from './App'`,
-		"node_modules/x/y":  `should be skipped`,
+		"package.json":     `{"name": "todo-app"}`,
+		"tsconfig.json":    `{"compilerOptions": {}}`,
+		"vite.config.ts":   `export default {}`,
+		"src/App.tsx":      `export default function App() {}`, // this one will be in file blocks
+		"src/main.tsx":     `import App from './App'`,
+		"node_modules/x/y": `should be skipped`,
 	}
 	for relPath, content := range scratchFiles {
 		full := filepath.Join(scratchDir, relPath)
@@ -3951,7 +4102,7 @@ func TestPersistScratchSkipsUpstreamCopies(t *testing.T) {
 	files := map[string]struct {
 		content string
 	}{
-		"styles/main.css": {content: "body { color: red }"},                              // designer's own work
+		"styles/main.css":  {content: "body { color: red }"},                              // designer's own work
 		"src/App.tsx":      {content: string(upstreamContent)},                            // exact copy of upstream
 		"src/Modified.tsx": {content: `export default function App() { return <span/> }`}, // modified — should be kept
 	}
@@ -4005,9 +4156,9 @@ func TestPersistScratchSkipsUpstreamCopies(t *testing.T) {
 
 func TestDetectProjectRoot(t *testing.T) {
 	tests := []struct {
-		name     string
-		layout   []string // files to create relative to scratch
-		wantSub  string   // expected subdirectory name, "" for root
+		name    string
+		layout  []string // files to create relative to scratch
+		wantSub string   // expected subdirectory name, "" for root
 	}{
 		{
 			name:    "manifest at root",

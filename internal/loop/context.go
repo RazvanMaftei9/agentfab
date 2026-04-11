@@ -9,18 +9,20 @@ import (
 
 // LoopContext carries FSM routing metadata through agent-to-agent messages.
 type LoopContext struct {
-	Definition        LoopDefinition   `json:"definition"`
-	State             LoopState        `json:"state"`
-	TaskID            string           `json:"task_id"`
-	Conductor         string           `json:"conductor"`
-	OriginalTask      string           `json:"original_task"`
-	UserRequest       string           `json:"user_request,omitempty"`
-	DepParts          []map[string]any `json:"dep_parts,omitempty"`
-	WorkSummary       string           `json:"work_summary,omitempty"`        // Latest working agent summary for terminal result.
-	WorkArtifactURI   string           `json:"work_artifact_uri,omitempty"`   // artifacts/<worker-agent>/ for terminal pass-through
-	WorkArtifactFiles []string         `json:"work_artifact_files,omitempty"` // cumulative worker artifact paths across revisions
-	DispatchNonce     string           `json:"dispatch_nonce,omitempty"`
-	DecisionContext   string           `json:"decision_context,omitempty"` // active project decisions for review enforcement
+	Definition        LoopDefinition    `json:"definition"`
+	State             LoopState         `json:"state"`
+	TaskID            string            `json:"task_id"`
+	Conductor         string            `json:"conductor"`
+	OriginalTask      string            `json:"original_task"`
+	UserRequest       string            `json:"user_request,omitempty"`
+	DepParts          []map[string]any  `json:"dep_parts,omitempty"`
+	AssignedInstances map[string]string `json:"assigned_instances,omitempty"`
+	ExecutionNodes    map[string]string `json:"execution_nodes,omitempty"`
+	WorkSummary       string            `json:"work_summary,omitempty"`        // Latest working agent summary for terminal result.
+	WorkArtifactURI   string            `json:"work_artifact_uri,omitempty"`   // artifacts/<worker-agent>/ for terminal pass-through
+	WorkArtifactFiles []string          `json:"work_artifact_files,omitempty"` // cumulative worker artifact paths across revisions
+	DispatchNonce     string            `json:"dispatch_nonce,omitempty"`
+	DecisionContext   string            `json:"decision_context,omitempty"` // active project decisions for review enforcement
 }
 
 // EncodeContext wraps a LoopContext as a message DataPart with a "loop_context" key.

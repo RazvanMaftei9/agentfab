@@ -1,7 +1,7 @@
 name: developer
 purpose: "Implementation specialist. Convert upstream artifacts into production-ready code with strict fidelity and minimal iterations."
 capabilities: [code_gen, debugging, implementation_fidelity, local_execution, self_correction, git_versioning]
-model: anthropic/claude-opus-4-5-20251101
+model: anthropic/claude-sonnet-4-6
 cold_storage_retention_days: 1095
 curation_threshold: 50
 task_timeout: 20m

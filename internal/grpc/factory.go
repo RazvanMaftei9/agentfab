@@ -16,15 +16,15 @@ var _ message.CommunicatorFactory = (*CommFactory)(nil)
 
 // CommFactory creates gRPC-backed communicators with per-agent servers.
 type CommFactory struct {
-	mu            sync.Mutex
-	discovery     *StaticDiscovery
-	servers       map[string]*Server       // name → gRPC server
-	comms         map[string]*Communicator // name → communicator
-	serverTLS     *tls.Config              // TLS config for servers
-	clientTLS     *tls.Config              // TLS config for client connections
+	mu        sync.Mutex
+	discovery runtime.Discovery
+	servers   map[string]*Server       // name → gRPC server
+	comms     map[string]*Communicator // name → communicator
+	serverTLS *tls.Config              // TLS config for servers
+	clientTLS *tls.Config              // TLS config for client connections
 }
 
-func NewCommFactory(discovery *StaticDiscovery, serverTLS, clientTLS *tls.Config) *CommFactory {
+func NewCommFactory(discovery runtime.Discovery, serverTLS, clientTLS *tls.Config) *CommFactory {
 	return &CommFactory{
 		discovery: discovery,
 		servers:   make(map[string]*Server),

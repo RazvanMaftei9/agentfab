@@ -17,6 +17,17 @@ import (
 
 // runTools executes post-processing tools on matched artifact files.
 func (a *Agent) runTools(ctx context.Context, rp *resultParts, requestID string, taskMeta map[string]string) {
+	tierPaths := a.toolTierPaths()
+	sharedDir := a.sharedToolDir()
+	if len(tierPaths) < 3 || sharedDir == "" {
+		return
+	}
+	if a.Workspace != nil && a.Workspace.Shared != nil {
+		if err := a.Workspace.Shared.Refresh(ctx); err != nil {
+			slog.Warn("refresh shared workspace failed", "agent", a.Def.Name, "error", err)
+		}
+	}
+
 	for _, tc := range a.Def.Tools {
 		if tc.Command == "" || !tc.IsPostProcess() {
 			continue
@@ -43,17 +54,13 @@ func (a *Agent) runTools(ctx context.Context, rp *resultParts, requestID string,
 		}
 
 		outputs, err := execTool(ctx, tc, execToolRequest{
-			dir: rp.dir,
-			resolvedDir: filepath.Join(a.Storage.SharedDir(), rp.dir),
+			dir:         rp.dir,
+			resolvedDir: filepath.Join(sharedDir, rp.dir),
 			agentName:   a.Def.Name,
 			requestID:   requestID,
 			taskMeta:    taskMeta,
 			files:       matched,
-			tierPaths: []string{
-				a.Storage.TierDir(runtime.TierScratch),
-				a.Storage.TierDir(runtime.TierAgent),
-				a.Storage.TierDir(runtime.TierShared),
-			},
+			tierPaths:   tierPaths,
 			readFile: func(relPath string) ([]byte, error) {
 				return a.Storage.Read(ctx, runtime.TierShared, fmt.Sprintf("%s/%s", rp.dir, relPath))
 			},
@@ -78,8 +85,33 @@ func (a *Agent) runTools(ctx context.Context, rp *resultParts, requestID string,
 	}
 }
 
+func (a *Agent) toolTierPaths() []string {
+	if a.ToolExecutor != nil && len(a.ToolExecutor.TierPaths) >= 3 {
+		return a.ToolExecutor.TierPaths
+	}
+	if a.Workspace != nil {
+		return a.Workspace.TierPaths()
+	}
+	if a.Storage == nil {
+		return nil
+	}
+	return []string{
+		a.Storage.TierDir(runtime.TierScratch),
+		a.Storage.TierDir(runtime.TierAgent),
+		a.Storage.TierDir(runtime.TierShared),
+	}
+}
+
+func (a *Agent) sharedToolDir() string {
+	tierPaths := a.toolTierPaths()
+	if len(tierPaths) < 3 {
+		return ""
+	}
+	return tierPaths[2]
+}
+
 type execToolRequest struct {
-	dir string
+	dir         string
 	resolvedDir string
 	agentName   string
 	requestID   string

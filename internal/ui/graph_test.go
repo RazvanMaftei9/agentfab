@@ -120,6 +120,13 @@ func TestLayoutDAG_TooNarrow(t *testing.T) {
 	}
 }
 
+func TestTaskAgentLabelIncludesExecutionNode(t *testing.T) {
+	task := event.TaskSummary{Agent: "designer", ExecutionNode: "node-2"}
+	if got := taskAgentLabel(task); got != "designer@node-2" {
+		t.Fatalf("taskAgentLabel() = %q, want designer@node-2", got)
+	}
+}
+
 func TestRenderDAG_StatusColors(t *testing.T) {
 	tasks := []event.TaskSummary{
 		{ID: "T1", Agent: "designer", Status: "completed"},

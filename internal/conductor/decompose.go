@@ -71,6 +71,7 @@ Rules:
 - Before creating tasks, review "Prior relevant knowledge" carefully. If prior work already addresses the user's request, produce ONLY a minimal task graph (e.g., a single task to verify existing artifacts)
 - If the request is an exact repeat, respond with a single task: "Review and confirm existing work on [topic]"
 - Only create full multi-task graphs when the request asks for genuinely new work not covered by existing knowledge
+- EXPLICIT FAN-OUT EXCEPTION: When the user request explicitly enumerates a list of independent items (files, packages, services, papers, components, modules, directories, etc.) and asks for one task per item, create exactly one task per item even if the count is large. Independent fan-out is a legitimate workload shape — do not aggregate, summarize, or fold the items into a smaller number of tasks. The "keep the graph small" rule does not apply when the user has already chosen the granularity. The user-provided enumeration is the task list.
 - Each task must be assigned to one of the available agents
 - Use depends_on to express ordering constraints
 - Keep the graph as small as possible — but never skip review loops to save tasks

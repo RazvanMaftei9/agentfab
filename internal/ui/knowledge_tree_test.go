@@ -164,6 +164,9 @@ func TestRenderKnowledgeTree_FullTree(t *testing.T) {
 	if !strings.Contains(joined, "◆") {
 		t.Error("expected root symbol ◆ in output")
 	}
+	if !strings.Contains(joined, "Direct context") {
+		t.Error("expected grouped direct-context section header")
+	}
 	if !strings.Contains(joined, "├──") && !strings.Contains(joined, "└──") {
 		t.Error("expected branch connectors in arborescent output")
 	}
@@ -242,6 +245,48 @@ func TestRenderKnowledgeTree_FlashAnimation(t *testing.T) {
 	// They should differ because of the flash.
 	if joined0 == joined2 {
 		t.Error("expected different output between frame 0 and frame 2 (flash animation)")
+	}
+}
+
+func TestRenderKnowledgeTree_BalancesSectionsWhenTruncated(t *testing.T) {
+	own := []event.KnowledgeNodeInfo{
+		{ID: "designer/design-system", Agent: "designer", Title: "Browser DAW Design System", Tags: []string{"decision"}},
+		{ID: "developer/request", Agent: "developer", Title: "Implement the browser-based DAW MVP", Tags: []string{"user-request"}},
+	}
+	related := []event.KnowledgeRelInfo{
+		{KnowledgeNodeInfo: event.KnowledgeNodeInfo{ID: "architect/a1", Agent: "architect", Title: "Architecture Alpha"}, Depth: 2},
+		{KnowledgeNodeInfo: event.KnowledgeNodeInfo{ID: "architect/a2", Agent: "architect", Title: "Architecture Beta"}, Depth: 2},
+		{KnowledgeNodeInfo: event.KnowledgeNodeInfo{ID: "architect/a3", Agent: "architect", Title: "Architecture Gamma"}, Depth: 2},
+		{KnowledgeNodeInfo: event.KnowledgeNodeInfo{ID: "architect/a4", Agent: "architect", Title: "Architecture Delta"}, Depth: 2},
+		{KnowledgeNodeInfo: event.KnowledgeNodeInfo{ID: "architect/a5", Agent: "architect", Title: "Architecture Epsilon"}, Depth: 2},
+		{KnowledgeNodeInfo: event.KnowledgeNodeInfo{ID: "architect/a6", Agent: "architect", Title: "Architecture Zeta"}, Depth: 2},
+	}
+	tree := buildKnowledgeTree(own, related, nil)
+
+	noColor := func(agent string) string { return "" }
+	lines := renderKnowledgeTreeLines(tree, "developer", 0, 100, false, noColor)
+	if lines == nil {
+		t.Fatal("expected non-nil lines")
+	}
+	joined := strings.Join(lines, "\n")
+
+	if !strings.Contains(joined, "Decisions") {
+		t.Fatal("expected Decisions section in truncated output")
+	}
+	if !strings.Contains(joined, "Direct context") {
+		t.Fatal("expected Direct context section in truncated output")
+	}
+	if !strings.Contains(joined, "Related context") {
+		t.Fatal("expected Related context section in truncated output")
+	}
+	if !strings.Contains(joined, "Browser DAW Design System") {
+		t.Fatal("expected visible decision node in truncated output")
+	}
+	if !strings.Contains(joined, "Implement the browser-based DAW MVP") {
+		t.Fatal("expected visible direct-context node in truncated output")
+	}
+	if !strings.Contains(joined, "Architecture Alpha") {
+		t.Fatal("expected visible related-context node in truncated output")
 	}
 }
 
@@ -339,10 +384,59 @@ func TestNodeLabel(t *testing.T) {
 		{"dev/auth-impl", "Custom Title", "Custom Title"},
 	}
 	for _, tt := range tests {
-		got := nodeLabel(tt.id, tt.title)
+		got := nodeLabel(tt.id, tt.title, "")
 		if got != tt.want {
 			t.Errorf("nodeLabel(%q, %q) = %q, want %q", tt.id, tt.title, got, tt.want)
 		}
+	}
+}
+
+func TestNodeLabelPrefersSummaryForLowSignalTitle(t *testing.T) {
+	got := nodeLabel("conductor/build", "Build", "Browser DAW MVP architecture and sequencing plan.")
+	if got != "Browser DAW MVP architecture and sequencing plan." {
+		t.Fatalf("nodeLabel() = %q, want summary-derived label", got)
+	}
+}
+
+func TestRenderKnowledgeTree_GroupsSections(t *testing.T) {
+	own := []event.KnowledgeNodeInfo{
+		{ID: "dev/core", Agent: "developer", Title: "Core editor state"},
+	}
+	related := []event.KnowledgeRelInfo{
+		{
+			KnowledgeNodeInfo: event.KnowledgeNodeInfo{
+				ID:      "arch/md3",
+				Agent:   "architect",
+				Title:   "Material Design 3",
+				Summary: "All UI should follow MD3.",
+				Tags:    []string{"decision", "design-system"},
+			},
+			Depth:     0,
+			Relations: []string{"decision"},
+		},
+		{
+			KnowledgeNodeInfo: event.KnowledgeNodeInfo{
+				ID:      "designer/piano-roll",
+				Agent:   "designer",
+				Title:   "Piano roll interaction details",
+				Summary: "Click, drag, resize, and snapping behavior.",
+			},
+			Depth:     2,
+			Relations: []string{"refines"},
+		},
+	}
+	tree := buildKnowledgeTree(own, related, nil)
+	lines := renderKnowledgeTreeLines(tree, "developer", 0, 120, false, func(string) string { return "" })
+	joined := strings.Join(lines, "\n")
+
+	if !strings.Contains(joined, "Decisions") {
+		t.Fatalf("expected Decisions section:\n%s", joined)
+	}
+	if !strings.Contains(joined, "Direct context") {
+		t.Fatalf("expected Direct context section:\n%s", joined)
+	}
+	if !strings.Contains(joined, "Related context") {
+		t.Fatalf("expected Related context section:\n%s", joined)
 	}
 }
 

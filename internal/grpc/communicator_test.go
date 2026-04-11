@@ -174,6 +174,123 @@ func TestSendToUnknownAgent(t *testing.T) {
 	}
 }
 
+func TestSendRoutesViaAssignedInstance(t *testing.T) {
+	discovery := NewStaticDiscovery()
+
+	sender, err := NewServer("conductor", ":0", 8)
+	if err != nil {
+		t.Fatalf("create sender server: %v", err)
+	}
+	defer sender.Stop()
+	go sender.Serve()
+
+	receiver, err := NewServer("developer", ":0", 8)
+	if err != nil {
+		t.Fatalf("create receiver server: %v", err)
+	}
+	defer receiver.Stop()
+	go receiver.Serve()
+
+	ctx := context.Background()
+	discovery.Register(ctx, "node-a/developer/1", runtime.Endpoint{Address: receiver.Addr()})
+
+	comm := NewCommunicator("conductor", sender, discovery)
+	defer comm.Close()
+
+	msg := &message.Message{
+		ID:        "msg-instance",
+		RequestID: "req-instance",
+		From:      "conductor",
+		To:        "developer",
+		Type:      message.TypeTaskAssignment,
+		Parts:     []message.Part{message.TextPart{Text: "route by assigned instance"}},
+		Metadata: map[string]string{
+			"assigned_instance": "node-a/developer/1",
+		},
+		Timestamp: time.Now(),
+	}
+
+	if err := comm.Send(ctx, msg); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+
+	select {
+	case received := <-receiver.Inbox():
+		if received.To != "developer" {
+			t.Fatalf("recipient = %q, want developer", received.To)
+		}
+		if received.Metadata["assigned_instance"] != "node-a/developer/1" {
+			t.Fatalf("assigned instance metadata = %q, want node-a/developer/1", received.Metadata["assigned_instance"])
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for routed message")
+	}
+}
+
+func TestSendToConductorIgnoresAssignedInstanceRouting(t *testing.T) {
+	discovery := NewStaticDiscovery()
+
+	sender, err := NewServer("developer", ":0", 8)
+	if err != nil {
+		t.Fatalf("create sender server: %v", err)
+	}
+	defer sender.Stop()
+	go sender.Serve()
+
+	conductor, err := NewServer("conductor", ":0", 8)
+	if err != nil {
+		t.Fatalf("create conductor server: %v", err)
+	}
+	defer conductor.Stop()
+	go conductor.Serve()
+
+	worker, err := NewServer("developer", ":0", 8)
+	if err != nil {
+		t.Fatalf("create worker server: %v", err)
+	}
+	defer worker.Stop()
+	go worker.Serve()
+
+	ctx := context.Background()
+	discovery.Register(ctx, "conductor", runtime.Endpoint{Address: conductor.Addr()})
+	discovery.Register(ctx, "node-a/developer/1", runtime.Endpoint{Address: worker.Addr()})
+
+	comm := NewCommunicator("developer", sender, discovery)
+	defer comm.Close()
+
+	msg := &message.Message{
+		ID:        "msg-conductor",
+		RequestID: "req-conductor",
+		From:      "developer",
+		To:        "conductor",
+		Type:      message.TypeTaskResult,
+		Parts:     []message.Part{message.TextPart{Text: "loop completed"}},
+		Metadata: map[string]string{
+			"assigned_instance": "node-a/developer/1",
+		},
+		Timestamp: time.Now(),
+	}
+
+	if err := comm.Send(ctx, msg); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+
+	select {
+	case received := <-conductor.Inbox():
+		if received.To != "conductor" {
+			t.Fatalf("recipient = %q, want conductor", received.To)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for conductor-bound message")
+	}
+
+	select {
+	case received := <-worker.Inbox():
+		t.Fatalf("worker received misrouted message for %q", received.To)
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
 func TestCommFactory(t *testing.T) {
 	discovery := NewStaticDiscovery()
 	factory := NewCommFactory(discovery, nil, nil)
@@ -339,6 +456,126 @@ func TestTLSRejectsSpoofedSender(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "sender mismatch") {
 		t.Fatalf("expected sender mismatch error, got: %v", err)
+	}
+}
+
+func TestTLSAllowsNodeIdentityToRepresentHostedInstance(t *testing.T) {
+	ca, err := NewClusterCA()
+	if err != nil {
+		t.Fatalf("create CA: %v", err)
+	}
+
+	nodeCert, err := ca.IssueCertWithOptions("node-a", IssueCertOptions{
+		IdentityURI: "spiffe://agentfab.local/fabric/test-fabric/node/node-a",
+	})
+	if err != nil {
+		t.Fatalf("issue node cert: %v", err)
+	}
+	receiverCert, err := ca.IssueCertWithOptions("developer", IssueCertOptions{
+		IdentityURI: "spiffe://agentfab.local/fabric/test-fabric/node/node-b/agent/developer/instance/node-b/developer",
+	})
+	if err != nil {
+		t.Fatalf("issue receiver cert: %v", err)
+	}
+
+	discovery := NewStaticDiscovery()
+
+	sender, err := NewServer("architect", ":0", 8, ServerTLSConfig(nodeCert, ca.Pool()))
+	if err != nil {
+		t.Fatalf("create sender server: %v", err)
+	}
+	defer sender.Stop()
+	go sender.Serve()
+
+	receiver, err := NewServer("developer", ":0", 8, ServerTLSConfig(receiverCert, ca.Pool()))
+	if err != nil {
+		t.Fatalf("create receiver server: %v", err)
+	}
+	defer receiver.Stop()
+	go receiver.Serve()
+
+	ctx := context.Background()
+	discovery.Register(ctx, "node-b/developer/1", runtime.Endpoint{Address: "localhost:" + portOf(receiver)})
+
+	comm := NewCommunicator("architect", sender, discovery, ClientTLSConfig(nodeCert, ca.Pool()))
+	defer comm.Close()
+
+	err = comm.Send(ctx, &message.Message{
+		ID:   "node-backed-1",
+		From: "architect",
+		To:   "developer",
+		Type: message.TypeTaskAssignment,
+		Metadata: map[string]string{
+			"assigned_instance": "node-b/developer/1",
+			"sender_node":       "node-a",
+			"sender_instance":   "node-a/architect/1",
+		},
+	})
+	if err != nil {
+		t.Fatalf("send: %v", err)
+	}
+
+	select {
+	case <-receiver.Inbox():
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for node-backed message")
+	}
+}
+
+func TestTLSRejectsNodeIdentityWithoutMatchingSenderMetadata(t *testing.T) {
+	ca, err := NewClusterCA()
+	if err != nil {
+		t.Fatalf("create CA: %v", err)
+	}
+
+	nodeCert, err := ca.IssueCertWithOptions("node-a", IssueCertOptions{
+		IdentityURI: "spiffe://agentfab.local/fabric/test-fabric/node/node-a",
+	})
+	if err != nil {
+		t.Fatalf("issue node cert: %v", err)
+	}
+	receiverCert, err := ca.IssueCertWithOptions("developer", IssueCertOptions{
+		IdentityURI: "spiffe://agentfab.local/fabric/test-fabric/node/node-b/agent/developer/instance/node-b/developer",
+	})
+	if err != nil {
+		t.Fatalf("issue receiver cert: %v", err)
+	}
+
+	discovery := NewStaticDiscovery()
+
+	sender, err := NewServer("architect", ":0", 8, ServerTLSConfig(nodeCert, ca.Pool()))
+	if err != nil {
+		t.Fatalf("create sender server: %v", err)
+	}
+	defer sender.Stop()
+	go sender.Serve()
+
+	receiver, err := NewServer("developer", ":0", 8, ServerTLSConfig(receiverCert, ca.Pool()))
+	if err != nil {
+		t.Fatalf("create receiver server: %v", err)
+	}
+	defer receiver.Stop()
+	go receiver.Serve()
+
+	ctx := context.Background()
+	discovery.Register(ctx, "node-b/developer/1", runtime.Endpoint{Address: "localhost:" + portOf(receiver)})
+
+	comm := NewCommunicator("architect", sender, discovery, ClientTLSConfig(nodeCert, ca.Pool()))
+	defer comm.Close()
+
+	err = comm.Send(ctx, &message.Message{
+		ID:   "node-backed-bad-1",
+		From: "architect",
+		To:   "developer",
+		Type: message.TypeTaskAssignment,
+		Metadata: map[string]string{
+			"assigned_instance": "node-b/developer/1",
+			"sender_node":       "node-a",
+			"sender_instance":   "node-a/designer/1",
+		},
+	})
+	if err == nil {
+		t.Fatal("expected node-backed spoofed sender to be rejected")
 	}
 }
 
