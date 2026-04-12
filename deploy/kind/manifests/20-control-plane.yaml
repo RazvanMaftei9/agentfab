@@ -1,0 +1,122 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: control-plane
+  namespace: agentfab
+  labels:
+    app.kubernetes.io/name: agentfab
+    app.kubernetes.io/component: control-plane
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: agentfab
+    app.kubernetes.io/component: control-plane
+  ports:
+    - name: grpc
+      port: 50051
+      targetPort: 50051
+      protocol: TCP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: control-plane
+  namespace: agentfab
+  labels:
+    app.kubernetes.io/name: agentfab
+    app.kubernetes.io/component: control-plane
+spec:
+  replicas: 1
+  # Recreate ensures the join-token state file in the data dir doesn't get
+  # touched by two pods at once if a rollout overlaps.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: agentfab
+      app.kubernetes.io/component: control-plane
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: agentfab
+        app.kubernetes.io/component: control-plane
+    spec:
+      securityContext:
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+      initContainers:
+        # Seed the shared CA into the data dir so that all agentfab pods
+        # trust the same root. Without this each pod's local-dev provider
+        # would generate its own CA and mTLS would fail across pods.
+        - name: seed-ca
+          image: agentfab:dev
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              dest=/var/lib/agentfab/shared/identity/local-dev
+              mkdir -p "$dest"
+              cp /etc/agentfab-ca/ca.pem "$dest/ca.pem"
+              cp /etc/agentfab-ca/ca-key.pem "$dest/ca-key.pem"
+              chmod 600 "$dest"/*.pem
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/agentfab
+            - name: cluster-ca
+              mountPath: /etc/agentfab-ca
+              readOnly: true
+      containers:
+        - name: control-plane
+          image: agentfab:dev
+          imagePullPolicy: IfNotPresent
+          args:
+            - control-plane
+            - serve
+            - --config=/etc/agentfab/agents.yaml
+            - --data-dir=/var/lib/agentfab
+            - --listen=0.0.0.0:50051
+          ports:
+            - name: grpc
+              containerPort: 50051
+              protocol: TCP
+          envFrom:
+            - secretRef:
+                name: agentfab-llm
+                optional: true
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: fabric
+              mountPath: /etc/agentfab/agents.yaml
+              subPath: agents.yaml
+              readOnly: true
+            - name: data
+              mountPath: /var/lib/agentfab
+            - name: tmp
+              mountPath: /tmp
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "1"
+              memory: "512Mi"
+      volumes:
+        - name: fabric
+          configMap:
+            name: agentfab-fabric
+        - name: cluster-ca
+          secret:
+            secretName: agentfab-cluster-ca
+            defaultMode: 0400
+        - name: data
+          hostPath:
+            path: /var/lib/agentfab-host/runtime/control-plane
+            type: DirectoryOrCreate
+        - name: tmp
+          emptyDir: {}

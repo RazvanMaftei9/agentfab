@@ -52,8 +52,10 @@ agents.yaml
 /claude
 CLAUDE.md
 
-# deployment tooling is user-local and not part of the shipped product
-/deploy/
+# deployment tooling
+/deploy/kind/secrets/*.env
+!/deploy/kind/secrets/*.env.example
+/deploy/kind/state/
 
 # demo artifact bundles (generated, large, user-local)
 /demo-artifacts/

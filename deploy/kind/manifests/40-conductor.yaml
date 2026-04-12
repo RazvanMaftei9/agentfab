@@ -1,0 +1,96 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: conductor
+  namespace: agentfab
+  labels:
+    app.kubernetes.io/name: agentfab
+    app.kubernetes.io/component: conductor
+spec:
+  restartPolicy: Always
+  securityContext:
+    runAsUser: 65532
+    runAsGroup: 65532
+    fsGroup: 65532
+  initContainers:
+    - name: seed-ca
+      image: agentfab:dev
+      imagePullPolicy: IfNotPresent
+      command: ["/bin/sh", "-c"]
+      args:
+        - |
+          set -eu
+          dest=/var/lib/agentfab/shared/identity/local-dev
+          mkdir -p "$dest"
+          cp /etc/agentfab-ca/ca.pem "$dest/ca.pem"
+          cp /etc/agentfab-ca/ca-key.pem "$dest/ca-key.pem"
+          chmod 600 "$dest"/*.pem
+      volumeMounts:
+        - name: data
+          mountPath: /var/lib/agentfab
+        - name: cluster-ca
+          mountPath: /etc/agentfab-ca
+          readOnly: true
+  containers:
+    - name: shell
+      image: agentfab:dev
+      imagePullPolicy: IfNotPresent
+      # Stay running so the operator can `kubectl exec -it conductor --
+      # agentfab run --external-nodes ...` and get a real interactive TUI
+      # session attached to their terminal. The conductor doesn't need to
+      # auto-start; each exec is a fresh session against the same fabric.
+      command: ["/bin/sh", "-c", "exec sleep infinity"]
+      tty: true
+      stdin: true
+      envFrom:
+        - secretRef:
+            name: agentfab-llm
+            optional: true
+      env:
+        - name: AGENTFAB_DATA_DIR
+          value: /var/lib/agentfab
+        - name: AGENTFAB_CONFIG
+          value: /etc/agentfab/agents.yaml
+        - name: AGENTFAB_ADVERTISE_HOST
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+      volumeMounts:
+        - name: fabric
+          mountPath: /etc/agentfab/agents.yaml
+          subPath: agents.yaml
+          readOnly: true
+        - name: data
+          mountPath: /var/lib/agentfab
+        - name: fabric-storage
+          mountPath: /mnt/agentfab
+        - name: tmp
+          mountPath: /tmp
+      resources:
+        requests:
+          cpu: "50m"
+          memory: "128Mi"
+        limits:
+          cpu: "1"
+          memory: "512Mi"
+  volumes:
+    - name: fabric
+      configMap:
+        name: agentfab-fabric
+    - name: cluster-ca
+      secret:
+        secretName: agentfab-cluster-ca
+        defaultMode: 0400
+    - name: fabric-storage
+      hostPath:
+        path: /var/lib/agentfab-host/fabric
+        type: DirectoryOrCreate
+    - name: data
+      emptyDir: {}
+    - name: tmp
+      emptyDir: {}

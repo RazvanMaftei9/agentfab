@@ -1,0 +1,29 @@
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: agentfab-test
+
+# Three nodes lets us spread agentfab control plane / node / conductor pods
+# across distinct kubelet hosts so kind exercises pod-to-pod networking the
+# way a real cluster would. The control-plane label here is the kind/k8s
+# control-plane node, not the agentfab control plane.
+nodes:
+  - role: control-plane
+    extraMounts:
+      - hostPath: __HOST_ROOT__
+        containerPath: /var/lib/agentfab-host
+  - role: worker
+    extraMounts:
+      - hostPath: __HOST_ROOT__
+        containerPath: /var/lib/agentfab-host
+  - role: worker
+    extraMounts:
+      - hostPath: __HOST_ROOT__
+        containerPath: /var/lib/agentfab-host
+
+# Use containerd by default; nothing fancy is needed for this fabric.
+networking:
+  apiServerAddress: "127.0.0.1"
+  # CNI defaults are fine for in-cluster pod-to-pod connectivity. The
+  # agentfab conductor reaches each node directly via its Pod IP using the
+  # endpoint the node registers with the control plane, so no Service is
+  # required for the node Deployment.

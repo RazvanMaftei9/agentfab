@@ -1,0 +1,27 @@
+# Build artifacts that shouldn't enter the build context.
+/agentfab
+/agentfab-data
+/system-data
+/bench-results
+/logs
+
+# Local dev state.
+.env
+.DS_Store
+*.swp
+
+# Editor / VCS.
+.git
+.idea
+.vscode
+
+# Existing local config -- pods get their own via ConfigMap.
+agents.yaml
+
+# Tests artifacts.
+*.test
+*.out
+coverage.*
+
+# The deploy/ tree itself doesn't need to be inside the image.
+deploy/
