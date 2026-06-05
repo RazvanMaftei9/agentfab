@@ -354,8 +354,16 @@ func runCmd() *cobra.Command {
 		Use:   "run",
 		Short: "Start the fabric and enter interactive mode",
 		RunE: func(cmd *cobra.Command, args []string) error {
+			logLevel := slog.LevelWarn
+			if debug {
+				// --debug now also enables slog Debug level on stderr, in
+				// addition to the per-agent input.jsonl/output.jsonl files.
+				// Lets diagnostics like "sandbox env composed" actually reach
+				// the operator's terminal.
+				logLevel = slog.LevelDebug
+			}
 			slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
-				Level: slog.LevelWarn,
+				Level: logLevel,
 			})))
 
 			tty := ui.IsTTY(os.Stdout)
@@ -607,7 +615,27 @@ func runCmd() *cobra.Command {
 				return fmt.Errorf("create conductor: %w", err)
 			}
 
-			if templates, err := conductor.LoadTemplates(defaults.TemplateFS); err == nil && len(templates) > 0 {
+			templates, _ := conductor.LoadTemplates(defaults.TemplateFS)
+			if configFile != "" {
+				projectDir := filepath.Dir(configFile)
+				if _, statErr := os.Stat(filepath.Join(projectDir, "templates")); statErr == nil {
+					if projectTemplates, loadErr := conductor.LoadTemplates(os.DirFS(projectDir)); loadErr == nil && len(projectTemplates) > 0 {
+						byName := make(map[string]conductor.DecomposeTemplate, len(templates)+len(projectTemplates))
+						for _, t := range templates {
+							byName[t.Name] = t
+						}
+						for _, t := range projectTemplates {
+							byName[t.Name] = t
+						}
+						templates = templates[:0]
+						for _, t := range byName {
+							templates = append(templates, t)
+						}
+						fmt.Printf("Loaded %d project template(s) from %s/templates\n", len(projectTemplates), projectDir)
+					}
+				}
+			}
+			if len(templates) > 0 {
 				c.Templates = templates
 			}
 

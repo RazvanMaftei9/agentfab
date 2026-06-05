@@ -308,12 +308,17 @@ func TestTruncateDepsUnderBudget(t *testing.T) {
 }
 
 func TestTruncateDepsOverBudget(t *testing.T) {
-	big := strings.Repeat("x", 1000)
+	// Budget must exceed the 4 KB floor in truncateDeps to exercise the
+	// truncation path. Floor was added to prevent a negative-bounds panic
+	// when accumulated pipeline context overflows the LLM input cap
+	// (project_agentfab_known_bugs item 2).
+	big := strings.Repeat("x", 20000)
 	deps := []string{big, big}
-	result := truncateDeps(deps, 500) // 500 budget for 2000 chars
+	result := truncateDeps(deps, 8192)
 
 	for i, d := range result {
-		if len(d) > 350 { // each gets ~250 + truncation note
+		// Each dep gets ~4 KB + truncation note. Cap at 5 KB.
+		if len(d) > 5120 {
 			t.Errorf("dep %d not truncated enough: %d chars", i, len(d))
 		}
 		if !strings.Contains(d, "truncated") {
@@ -324,9 +329,9 @@ func TestTruncateDepsOverBudget(t *testing.T) {
 
 func TestTruncateDepsMixedSizes(t *testing.T) {
 	small := "tiny"
-	big := strings.Repeat("x", 1000)
+	big := strings.Repeat("x", 20000)
 	deps := []string{small, big}
-	result := truncateDeps(deps, 300)
+	result := truncateDeps(deps, 8192)
 
 	// Small dep should be kept as-is.
 	if result[0] != "tiny" {
@@ -2745,13 +2750,16 @@ func TestBuildTaskInputUsesArtifactFiles(t *testing.T) {
 // --- Fix 2 Tests: Tool Loop Convergence ---
 
 func TestMaxIterationsForScope(t *testing.T) {
+	// Updated 2026-05 after the bump from {small:3, large:20, standard:10}
+	// to the current values — the previous bounds were too tight for the
+	// us-energy-grid analytical agents (project_agentfab_known_bugs).
 	tests := []struct {
 		scope string
 		want  int
 	}{
-		{"small", 3},
-		{"", 10},
-		{"large", 20},
+		{"small", 10},
+		{"", 30},
+		{"large", 75},
 	}
 	for _, tt := range tests {
 		got := maxIterationsForScope(tt.scope)

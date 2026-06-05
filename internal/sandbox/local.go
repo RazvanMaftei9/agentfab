@@ -3,6 +3,7 @@ package sandbox
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
 	"strings"
@@ -72,6 +73,35 @@ func Run(ctx context.Context, cfg Config, env []string, name string, args ...str
 	cmdEnv = setEnvAll(cmdEnv, env...)
 
 	cmd.Env = cmdEnv
+
+	// Diagnostic: surface whether the tier env vars are reaching the sandbox.
+	// Logs ONLY keys (never values) to avoid leaking secrets. Visible with
+	// --debug.
+	if slog.Default().Enabled(ctx, slog.LevelDebug) {
+		keys := make([]string, 0, len(cmdEnv))
+		hasShared, hasScratch, hasAgent := false, false, false
+		for _, entry := range cmdEnv {
+			if eq := strings.IndexByte(entry, '='); eq > 0 {
+				k := entry[:eq]
+				keys = append(keys, k)
+				switch k {
+				case "SHARED_DIR":
+					hasShared = true
+				case "SCRATCH_DIR":
+					hasScratch = true
+				case "AGENT_DIR":
+					hasAgent = true
+				}
+			}
+		}
+		slog.Debug("sandbox env composed",
+			"command", name,
+			"env_key_count", len(keys),
+			"has_SHARED_DIR", hasShared,
+			"has_SCRATCH_DIR", hasScratch,
+			"has_AGENT_DIR", hasAgent,
+		)
+	}
 
 	// Capture output to a temp file instead of pipes. cmd.Wait() returns
 	// when the shell exits. CombinedOutput() would block until ALL holders

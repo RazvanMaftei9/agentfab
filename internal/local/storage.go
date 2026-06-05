@@ -21,6 +21,18 @@ type Storage struct {
 // NewStorage creates a local filesystem storage rooted at baseDir.
 // agentName scopes shared-volume writes to artifacts/{agentName}/.
 func NewStorage(baseDir, agentName string) *Storage {
+	// Absolutize baseDir before deriving tier roots. If a caller passes a
+	// relative baseDir (e.g. `./.data`), the resulting SharedRoot/AgentRoot
+	// would be relative too — and when exported into agent processes via
+	// $SHARED_DIR/$AGENT_DIR, those agents resolve the relative path against
+	// their own CWD (typically the absolute scratch tempdir from os.TempDir()).
+	// The resulting writes land at a path that, on parent-side promotion to
+	// the agentfab CWD-relative shared root, nests under the agent's
+	// artifacts directory. See us-energy-grid dryrun 2026-05-25 nested-path
+	// bug for the worked example.
+	if abs, err := filepath.Abs(baseDir); err == nil {
+		baseDir = abs
+	}
 	return NewStorageWithLayout(runtime.StorageLayout{
 		SharedRoot:  filepath.Join(baseDir, "shared"),
 		AgentRoot:   filepath.Join(baseDir, "agents"),

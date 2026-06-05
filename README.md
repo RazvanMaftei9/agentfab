@@ -135,6 +135,7 @@ Go 1.24+.
 - [Architecture](docs/architecture.md)
 - [Runtime Modes](docs/runtime-modes.md)
 - [Orchestration Internals](docs/orchestration-internals.md)
+- [Storage Architecture](docs/storage-architecture.md)
 - [Identity Architecture](docs/identity-architecture.md)
 - [Production Identity Deployment](docs/production-identity-deployment.md)
 - [Roadmap](docs/roadmap.md)

@@ -157,6 +157,13 @@ func (e *ToolExecutor) Execute(ctx context.Context, call schema.ToolCall) (strin
 				env = append(env, envName+"="+v)
 			}
 		}
+
+		// Custom tools need SCRATCH_DIR/AGENT_DIR/SHARED_DIR/HOME just like the
+		// shell tool does. Previously this branch did not include SandboxEnv(),
+		// so any custom-tool command that referenced $SHARED_DIR would expand to
+		// an empty string and any Python subprocess it spawned would see
+		// os.environ['SHARED_DIR'] unset and fall back to a relative default.
+		env = append(env, e.SandboxEnv()...)
 	}
 
 	timeout := 30 * time.Second

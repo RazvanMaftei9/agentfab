@@ -14,10 +14,31 @@ import (
 )
 
 const (
-	defaultCallTimeout = 10 * time.Minute
-	retryCallTimeout   = 3 * time.Minute // shorter timeout for retry attempts
-	maxRetries         = 3
-	baseRetryDelay     = 2 * time.Second
+	// defaultCallTimeout was raised from 25m to 35m on 2026-05-27 to
+	// accommodate the us-energy-grid full-US run, where viz-engineer
+	// streams a ~30 KB HTML+JS bundle on Opus 4.7. Opus output rate is
+	// roughly half Sonnet's, so a single viz call needs ~12 min of
+	// streaming time alone; the original 25 min left only ~12 min of
+	// slack for thinking before SSE timeout. 35 min gives ~22 min of
+	// slack which is the right margin for code-gen tasks on Opus.
+	// Analytical agents on Sonnet finish in 30-90s; the longer timeout
+	// is only ever hit by the long-tail.
+	defaultCallTimeout = 35 * time.Minute
+	retryCallTimeout   = 12 * time.Minute // shorter timeout for retry attempts (proportional to default)
+
+	// maxRetries was raised from 3 to 6 on 2026-05-27 as the lightweight
+	// approximation of roadmap item A (per-call retry-with-checkpoint).
+	// The full checkpoint mechanism — persist tool-loop state across LLM
+	// failures so a stalled SSE stream doesn't discard 30-60 min of work —
+	// is deferred; in its place this bump gives a single inference call
+	// 35m + 6×12m = 107m of total patience before escalating to the task
+	// level. Combined with viz-engineer's task_timeout of 60m (raise to
+	// 120m for full-US), this means an SSE stall blocks a retry rather
+	// than wiping the task. Watch for: cumulative retries on a single
+	// call where every attempt streams ~zero tokens (the diagnostic for
+	// a deeper provider issue that no amount of retry will fix).
+	maxRetries     = 6
+	baseRetryDelay = 2 * time.Second
 )
 
 // RetryCallback is called before each retry attempt.
@@ -32,7 +53,7 @@ type MeteredModel struct {
 	OnChunk     ChunkCallback  // Optional streaming progress callback.
 	OnRetry     RetryCallback  // Optional callback fired before each retry attempt.
 	DebugLog    *DebugStore    // Optional debug store for per-agent request/response logging.
-	CallTimeout time.Duration  // Per-call timeout. Zero uses defaultCallTimeout (10m).
+	CallTimeout time.Duration  // Per-call timeout. Zero uses defaultCallTimeout (35m).
 	Options     []model.Option // Provider-specific options (e.g., prompt caching).
 }
 
@@ -70,7 +91,7 @@ func (m *MeteredModel) Generate(ctx context.Context, input []*schema.Message) (*
 
 		callTimeout := timeout
 		if attempt > 0 {
-			callTimeout = retryCallTimeout // 3min for retries vs 10min first attempt
+			callTimeout = retryCallTimeout // 12min for retries vs 35min first attempt
 		}
 		callCtx, cancel := context.WithTimeout(ctx, callTimeout)
 

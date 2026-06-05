@@ -2,6 +2,9 @@ package local
 
 import (
 	"context"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/razvanmaftei/agentfab/internal/runtime"
@@ -214,6 +217,105 @@ func TestStorageScopeBypassViaDotDot(t *testing.T) {
 	err := s.Write(ctx, runtime.TierShared, "artifacts/developer/../planner/secret.md", []byte("pwned"))
 	if err == nil {
 		t.Fatal("should reject scope bypass via .. within allowed prefix")
+	}
+}
+
+// TestNewStorageAbsolutizesRelativeBaseDir is a regression test for the
+// us-energy-grid 2026-05-25 nested-path bug.
+//
+// When NewStorage is called with a relative baseDir (e.g. "./.data" — the
+// shape `agentfab run --data-dir ./.data` produces), the derived SharedRoot
+// and AgentRoot tier paths must be absolute. Otherwise the values exported
+// into agent processes via $SHARED_DIR / $AGENT_DIR resolve relative to the
+// agent's own CWD (typically the absolute scratch tempdir from os.TempDir()),
+// not the agentfab parent process CWD. Python scripts in agents that did
+// `Path(os.environ["SHARED_DIR"]) / "artifacts" / "<agent>"` would then write
+// to e.g. `/tmp/agentfab-scratch-xxx/.data/shared/artifacts/<agent>/`, and on
+// parent-side artifact promotion that whole subtree would land nested inside
+// the agent's actual artifacts directory at
+// `<repo>/.data/shared/artifacts/<agent>/.data/shared/artifacts/<agent>/...`.
+//
+// The fix: absolutize baseDir before deriving tier roots, so the env vars
+// agents see are always usable absolute paths regardless of the caller's
+// shell shape.
+func TestNewStorageAbsolutizesRelativeBaseDir(t *testing.T) {
+	// Snapshot and restore CWD — the test deliberately runs from a known
+	// directory because the absolute resolution of a relative baseDir
+	// depends on CWD at NewStorage call time.
+	origCWD, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(origCWD) })
+
+	workdir := t.TempDir()
+	if err := os.Chdir(workdir); err != nil {
+		t.Fatalf("chdir: %v", err)
+	}
+	// macOS resolves /tmp to /private/tmp; normalize so prefix comparisons
+	// below are stable across symlink-aware and naive joins.
+	resolvedWorkdir, err := filepath.EvalSymlinks(workdir)
+	if err != nil {
+		resolvedWorkdir = workdir
+	}
+
+	cases := []struct {
+		name    string
+		baseDir string
+	}{
+		{"dot-slash relative", "./.data"},
+		{"bare relative", ".data"},
+		{"plain relative", "data"},
+		{"nested relative", "var/lib/agentfab"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := NewStorage(tc.baseDir, "developer")
+
+			shared := s.TierDir(runtime.TierShared)
+			agent := s.TierDir(runtime.TierAgent)
+
+			if !filepath.IsAbs(shared) {
+				t.Fatalf("shared tier path not absolute: %q (baseDir=%q)", shared, tc.baseDir)
+			}
+			if !filepath.IsAbs(agent) {
+				t.Fatalf("agent tier path not absolute: %q (baseDir=%q)", agent, tc.baseDir)
+			}
+
+			// And the absolute path must resolve under the test workdir,
+			// not / or some surprising parent. Normalize through EvalSymlinks
+			// on the actual paths to handle the macOS /tmp → /private/tmp case.
+			resolvedShared, err := filepath.EvalSymlinks(filepath.Dir(shared))
+			if err != nil {
+				resolvedShared = filepath.Dir(shared)
+			}
+			if !strings.HasPrefix(resolvedShared, resolvedWorkdir) {
+				t.Fatalf("shared tier %q does not resolve under workdir %q (baseDir=%q)",
+					shared, resolvedWorkdir, tc.baseDir)
+			}
+		})
+	}
+}
+
+// TestNewStorageAcceptsAbsoluteBaseDir verifies that the absolutize step is
+// idempotent: passing an already-absolute baseDir still produces the same
+// (absolute) tier paths.
+func TestNewStorageAcceptsAbsoluteBaseDir(t *testing.T) {
+	base := t.TempDir() // os.MkdirTemp returns an absolute path
+	if !filepath.IsAbs(base) {
+		t.Fatalf("t.TempDir() returned non-absolute path %q — test premise broken", base)
+	}
+
+	s := NewStorage(base, "developer")
+
+	wantShared := filepath.Join(base, "shared")
+	wantAgent := filepath.Join(base, "agents", "developer")
+
+	if got := s.TierDir(runtime.TierShared); got != wantShared {
+		t.Fatalf("shared tier = %q, want %q", got, wantShared)
+	}
+	if got := s.TierDir(runtime.TierAgent); got != wantAgent {
+		t.Fatalf("agent tier = %q, want %q", got, wantAgent)
 	}
 }
 

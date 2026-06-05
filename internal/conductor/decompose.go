@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 
 	"github.com/cloudwego/eino/schema"
 	"github.com/razvanmaftei/agentfab/internal/config"
@@ -112,6 +113,11 @@ const decomposeMaxRetries = 1
 const decomposeMaxOutputTokens = 8192
 
 // Decompose breaks a user request into a task graph via LLM, retrying once on parse failure.
+// When a template marked strict matches the user request strongly enough
+// (MatchScore >= strictMatchThreshold), Decompose skips the LLM call entirely
+// and emits the template's literal task graph. This is the mitigation for the
+// recurring failure pattern where the conductor re-introduces tasks the
+// operator explicitly forbade in the prompt.
 func Decompose(ctx context.Context, generate func(context.Context, []*schema.Message) (*schema.Message, error), fabricDef *config.FabricDef, userRequest string, conductorKnowledge string, templates ...DecomposeTemplate) (*DecomposeResult, error) {
 	var roster []string
 	agentDesc := ""
@@ -121,6 +127,31 @@ func Decompose(ctx context.Context, generate func(context.Context, []*schema.Mes
 		}
 		roster = append(roster, a.Name)
 		agentDesc += fmt.Sprintf("- %s: %s (capabilities: %v)\n", a.Name, a.Purpose, a.Capabilities)
+	}
+
+	// Strict template-adherence: bypass the LLM decompose when a strict
+	// template strongly matches the user request.
+	if strict := selectStrictTemplate(templates, userRequest); strict != nil {
+		graph, name, err := strict.BuildTaskGraph("req-0")
+		if err != nil {
+			return nil, fmt.Errorf("strict template %q: %w", strict.Name, err)
+		}
+		if len(roster) > 0 {
+			if err := graph.ValidateWithRoster(roster); err != nil {
+				return nil, fmt.Errorf("strict template %q references unknown agent: %w", strict.Name, err)
+			}
+		}
+		slog.Info("decompose: strict template matched, bypassing LLM",
+			"template", strict.Name,
+			"score", strict.MatchScore(userRequest),
+			"tasks", len(graph.Tasks),
+			"loops", len(graph.Loops))
+		return &DecomposeResult{
+			Graph:      graph,
+			Name:       name,
+			Actionable: true,
+			TokenUsage: &message.TokenUsage{},
+		}, nil
 	}
 
 	knowledgeSection := ""
@@ -245,24 +276,24 @@ type taskNodeJSON struct {
 }
 
 type loopJSON struct {
-	ID             string           `json:"id"`
-	Participants   []string         `json:"participants"`
-	States         []stateJSON      `json:"states"`
-	Transitions    []transitionJSON `json:"transitions"`
-	InitialState   string           `json:"initial_state"`
-	TerminalStates []string         `json:"terminal_states"`
-	MaxTransitions int              `json:"max_transitions"`
+	ID             string           `json:"id" yaml:"id"`
+	Participants   []string         `json:"participants" yaml:"participants"`
+	States         []stateJSON      `json:"states" yaml:"states"`
+	Transitions    []transitionJSON `json:"transitions" yaml:"transitions"`
+	InitialState   string           `json:"initial_state" yaml:"initial_state"`
+	TerminalStates []string         `json:"terminal_states" yaml:"terminal_states"`
+	MaxTransitions int              `json:"max_transitions" yaml:"max_transitions"`
 }
 
 type stateJSON struct {
-	Name  string `json:"name"`
-	Agent string `json:"agent,omitempty"`
+	Name  string `json:"name" yaml:"name"`
+	Agent string `json:"agent,omitempty" yaml:"agent,omitempty"`
 }
 
 type transitionJSON struct {
-	From      string `json:"from"`
-	To        string `json:"to"`
-	Condition string `json:"condition,omitempty"`
+	From      string `json:"from" yaml:"from"`
+	To        string `json:"to" yaml:"to"`
+	Condition string `json:"condition,omitempty" yaml:"condition,omitempty"`
 }
 
 func parseTaskGraphWithRoster(content string, requestID string, roster []string) (*taskgraph.TaskGraph, string, error) {

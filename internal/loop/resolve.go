@@ -82,8 +82,15 @@ func BuildStatePrompt(taskDesc string, def *LoopDefinition, state, lastVerdict, 
 		}
 		b = append(b, "Only modify files that the reviewer flagged — do not regenerate unchanged files.\n"...)
 		b = append(b, "You MUST use ```file:path``` blocks to save any modifications you make.\n"...)
-		b = append(b, "Address the review feedback below.\n"...)
-		b = append(b, "The actionable review feedback is already included in this prompt under iterative loop feedback context.\n"...)
+		b = append(b, "\n## Iterative Loop Feedback Context\n"...)
+		if lastOutput != "" {
+			b = append(b, "The reviewer's most recent verdict and feedback follows. Use this as the authoritative list of required revisions.\n\n"...)
+			b = append(b, lastOutput...)
+			b = append(b, "\n\n"...)
+		} else {
+			b = append(b, "_No reviewer feedback was captured for this revision. Either (a) the reviewer's response was empty, or (b) the loop was triggered without an explicit verdict. If you cannot determine concrete revisions to apply, resubmit your previous work unchanged via end_turn and note that no actionable feedback was received — do not invent issues to fix._\n\n"...)
+		}
+		b = append(b, "Address the review feedback above.\n"...)
 		b = append(b, "Do NOT search for a separate review.md file.\n"...)
 		b = append(b, "Treat upstream dependency artifacts as source-of-truth constraints; reviewer feedback is advisory until verified.\n"...)
 		b = append(b, "If reviewer feedback conflicts with upstream artifacts, preserve artifact fidelity and explicitly note the conflict with file references.\n"...)

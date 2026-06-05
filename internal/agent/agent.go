@@ -114,11 +114,11 @@ func (a *Agent) contextBudget() int {
 func maxIterationsForScope(scope string) int {
 	switch scope {
 	case "small":
-		return 3
-	case "large":
-		return 20
-	default:
 		return 10
+	case "large":
+		return 75
+	default:
+		return 30
 	}
 }
 
@@ -1417,6 +1417,21 @@ func (a *Agent) executeTask(ctx context.Context, msg *message.Message) error {
 		scope = msg.Metadata["task_scope"]
 	}
 
+	// Option B (cross-task consistency): refresh the shared tier from storage
+	// before reading upstream artifacts. The stagedTier is a per-agent snapshot
+	// taken at workspace-open; without this refresh, downstream tasks dispatched
+	// in quick succession after an upstream task_result may see a stale snapshot
+	// (the upstream Sync may not have settled in storage when the downstream
+	// workspace was first materialized). Combined with the Sync barrier in
+	// sendResult, this gives a happens-before relationship across task
+	// boundaries. Long-term, see docs/storage-architecture.md for the
+	// content-addressable-URI direction that replaces this best-effort model.
+	if a.Workspace != nil && a.Workspace.Shared != nil {
+		if err := a.Workspace.Shared.Refresh(ctx); err != nil {
+			slog.Warn("workspace shared refresh failed", "agent", a.Def.Name, "error", err)
+		}
+	}
+
 	// Populate scratch with the agent's existing artifacts from shared storage.
 	// This is essential for bug-fix and iteration tasks where the project already
 	// exists from prior work but scratch starts empty.
@@ -1638,6 +1653,17 @@ func (a *Agent) buildResultParts(ctx context.Context, requestID, content string,
 }
 
 func (a *Agent) sendResult(ctx context.Context, original *message.Message, content string, failed bool, usage *message.TokenUsage, extraMeta map[string]string) error {
+	// Option B (cross-task consistency): flush local workspace writes to storage
+	// before signaling task completion to the conductor. Without this barrier,
+	// downstream tasks dispatched after task_result can race ahead and
+	// materialize their workspace from stale storage state, missing this task's
+	// outputs entirely. Best-effort: on error we still emit task_result so the
+	// run does not deadlock, but we log the failure.
+	if a.Workspace != nil {
+		if err := a.Workspace.Sync(ctx); err != nil {
+			slog.Warn("workspace sync failed before sendResult", "agent", a.Def.Name, "error", err)
+		}
+	}
 	// Pass task metadata for post-processing tools (git commit messages, etc.).
 	meta := map[string]string{}
 	if tid, ok := original.Metadata["task_id"]; ok {
@@ -2663,6 +2689,20 @@ func joinFileList(files []string, max int) string {
 // Each dep gets an equal share; any dep already under its share donates
 // the surplus to others.
 func truncateDeps(deps []string, budget int) []string {
+	if len(deps) == 0 {
+		return deps
+	}
+	// Clamp budget to a sane minimum. When the caller's input is so large
+	// that overhead alone exceeds the LLM context budget, we still need to
+	// emit some dependency context — otherwise the agent has no upstream
+	// information at all. A 4 KB floor lets the call return real (heavily
+	// truncated) deps rather than panicking on negative slice bounds.
+	const minBudget = 4096
+	if budget < minBudget {
+		slog.Warn("truncateDeps budget below floor; clamping",
+			"requested", budget, "applied", minBudget, "deps", len(deps))
+		budget = minBudget
+	}
 	total := 0
 	for _, d := range deps {
 		total += len(d)
