@@ -838,7 +838,7 @@ func (a *Agent) persistScratchToShared(ctx context.Context, rp *resultParts, exi
 		persisted[filepath.Clean(b.Path)] = true
 	}
 
-	const maxFileSize = 1 << 20 // 1MB per file — skip large binaries
+	const maxFileSize = 256 << 20
 	extra := 0
 
 	skipDirs := map[string]bool{
@@ -871,7 +871,15 @@ func (a *Agent) persistScratchToShared(ctx context.Context, rp *resultParts, exi
 		}
 
 		info, infoErr := d.Info()
-		if infoErr != nil || info.Size() > maxFileSize || info.Size() == 0 {
+		if infoErr != nil {
+			return nil
+		}
+		if info.Size() == 0 {
+			return nil
+		}
+		if info.Size() > maxFileSize {
+			slog.Warn("scratch file too large to promote, skipping",
+				"path", rel, "size_bytes", info.Size(), "limit_bytes", maxFileSize)
 			return nil
 		}
 

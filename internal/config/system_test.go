@@ -1,6 +1,8 @@
 package config
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -234,5 +236,53 @@ func TestProvidersRoundTrip(t *testing.T) {
 		if p.BaseURLEnv != "TOGETHER_URL" {
 			t.Errorf("together base_url_env: got %q, want %q", p.BaseURLEnv, "TOGETHER_URL")
 		}
+	}
+}
+
+// TestResolvePathsRelativeToConfigUsesConfigDir is a regression test for the
+// bug where a fabric config with a relative agents_dir loaded via --config from
+// outside the project directory would resolve agents_dir against CWD instead of
+// the config file's directory, silently falling back to embedded defaults.
+func TestResolvePathsRelativeToConfigUsesConfigDir(t *testing.T) {
+	projectDir := t.TempDir()
+
+	agentsDir := filepath.Join(projectDir, "agents")
+	if err := os.MkdirAll(agentsDir, 0755); err != nil {
+		t.Fatalf("create agents dir: %v", err)
+	}
+
+	agentYAML := []byte(`name: agent-a
+purpose: "Generic test agent for regression coverage."
+capabilities: [analysis]
+model: anthropic/claude-sonnet-4-6
+`)
+	if err := os.WriteFile(filepath.Join(agentsDir, "agent-a.yaml"), agentYAML, 0644); err != nil {
+		t.Fatalf("write agent yaml: %v", err)
+	}
+
+	fabricYAML := []byte("fabric:\n  name: test-project\n  version: 1\nagents_dir: agents\n")
+	configPath := filepath.Join(projectDir, "agents.yaml")
+	if err := os.WriteFile(configPath, fabricYAML, 0644); err != nil {
+		t.Fatalf("write fabric yaml: %v", err)
+	}
+
+	td, err := LoadFabricDef(configPath)
+	if err != nil {
+		t.Fatalf("LoadFabricDef: %v", err)
+	}
+
+	// Simulate calling from a different CWD by not chdiring — agents_dir is still
+	// relative at this point, so ResolveAgents resolved against CWD (which in
+	// tests is the package directory, not projectDir). After the fix, calling
+	// ResolvePathsRelativeToConfig must re-resolve against the config file's dir.
+	if err := ResolvePathsRelativeToConfig(td, configPath); err != nil {
+		t.Fatalf("ResolvePathsRelativeToConfig: %v", err)
+	}
+
+	if len(td.Agents) != 1 {
+		t.Fatalf("expected 1 agent from project agents_dir, got %d (likely fell back to embedded defaults)", len(td.Agents))
+	}
+	if td.Agents[0].Name != "agent-a" {
+		t.Errorf("expected agent name %q, got %q", "agent-a", td.Agents[0].Name)
 	}
 }

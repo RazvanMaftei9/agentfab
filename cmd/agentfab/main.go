@@ -367,7 +367,6 @@ func runCmd() *cobra.Command {
 			})))
 
 			tty := ui.IsTTY(os.Stdout)
-			projectDir := ""
 
 			// A single TermInput avoids leaking readLoopTTY goroutines on
 			// macOS where closing /dev/tty doesn't unblock a concurrent read().
@@ -434,7 +433,6 @@ func runCmd() *cobra.Command {
 								return fmt.Errorf("register project: %w", err)
 							}
 							configFile = existingCfg
-							projectDir = dir
 							if !cmd.Flags().Changed("data-dir") {
 								dataDir = dir
 							}
@@ -449,7 +447,6 @@ func runCmd() *cobra.Command {
 								return fmt.Errorf("register project: %w", err)
 							}
 							configFile = cfgPath
-							projectDir = dir
 							if !cmd.Flags().Changed("data-dir") {
 								dataDir = dir
 							}
@@ -474,7 +471,6 @@ func runCmd() *cobra.Command {
 									}
 									fmt.Printf("Recreated project %q at %s\n", found.Name, found.Dir)
 									configFile = cfgPath
-									projectDir = found.Dir
 									if !cmd.Flags().Changed("data-dir") {
 										dataDir = found.Dir
 									}
@@ -488,7 +484,6 @@ func runCmd() *cobra.Command {
 							continue
 						}
 						configFile = projectConfig
-						projectDir = found.Dir
 						if !cmd.Flags().Changed("data-dir") {
 							dataDir = found.Dir
 						}
@@ -511,7 +506,7 @@ func runCmd() *cobra.Command {
 				if err := td.ResolveAgents(); err != nil {
 					return fmt.Errorf("resolve agents from %q: %w", agentsDir, err)
 				}
-			} else if projectDir != "" {
+			} else {
 				if err := config.ResolvePathsRelativeToConfig(td, configFile); err != nil {
 					return err
 				}
@@ -1193,6 +1188,9 @@ func statusCmd() *cobra.Command {
 			td, err := config.LoadFabricDef(configFile)
 			if err != nil {
 				return fmt.Errorf("load fabric definition: %w", err)
+			}
+			if err := config.ResolvePathsRelativeToConfig(td, configFile); err != nil {
+				return err
 			}
 
 			fmt.Printf("Fabric: %s (v%d)\n\n", td.Fabric.Name, td.Fabric.Version)

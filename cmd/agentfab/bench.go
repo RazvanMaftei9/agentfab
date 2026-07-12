@@ -18,15 +18,15 @@ import (
 
 func benchCmd() *cobra.Command {
 	var (
-		scenarioFile string
-		scenarioDir  string
-		all          bool
-		runs         int
-		outputDir    string
-		configFile   string
-		debug        bool
-		smoke          bool
-		competitor     string
+		scenarioFile    string
+		scenarioDir     string
+		all             bool
+		runs            int
+		outputDir       string
+		configFile      string
+		debug           bool
+		smoke           bool
+		competitor      string
 		competitorModel string
 	)
 	cmd := &cobra.Command{
@@ -38,6 +38,9 @@ func benchCmd() *cobra.Command {
 			td, err := config.LoadFabricDef(configFile)
 			if err != nil {
 				return fmt.Errorf("load fabric definition: %w\nRun 'agentfab init' first", err)
+			}
+			if err := config.ResolvePathsRelativeToConfig(td, configFile); err != nil {
+				return err
 			}
 
 			var scenarios []bench.Scenario
@@ -233,11 +236,11 @@ func benchCmd() *cobra.Command {
 
 func benchCompareCmd() *cobra.Command {
 	var (
-		baselinePath   string
-		treatmentPath  string
-		baselineName   string
-		treatmentName  string
-		baselineConfig string
+		baselinePath    string
+		treatmentPath   string
+		baselineName    string
+		treatmentName   string
+		baselineConfig  string
 		treatmentConfig string
 	)
 	cmd := &cobra.Command{
