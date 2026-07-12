@@ -19,7 +19,7 @@ Upstream artifacts that a downstream agent consumes are conventionally located
 at `$SHARED_DIR/artifacts/<upstream-agent>/`. The conductor's task assignment
 references upstream task IDs so the receiving agent knows which paths to read.
 
-## Implementation today (May 2026)
+## Implementation today (July 2026)
 
 Each agent runtime owns a `runtime.Workspace`:
 

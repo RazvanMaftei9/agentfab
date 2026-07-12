@@ -41,7 +41,7 @@ Or write YAML directly:
 name: "security-auditor"
 purpose: "Audit code for vulnerabilities and compliance"
 capabilities: ["security_analysis", "compliance_check"]
-model: "anthropic/claude-sonnet-4-5-20250929"
+model: "anthropic/claude-sonnet-4-6"
 escalation_target: "architect"
 tools:
   - name: semgrep
@@ -51,6 +51,10 @@ verify:
   command: "cd $SCRATCH_DIR && semgrep --config auto --error . 2>&1"
   max_retries: 2
 ```
+
+## Task Templates
+
+Recurring request shapes can be captured as task-graph templates in a project-level `templates/` directory (they merge with the built-in defaults, overriding by name). By default templates are starting points the Conductor's decompose pass may adapt. Mark a template `strict: true` and it becomes authoritative: when its `match_keywords` strongly match the request, the template's literal task list is dispatched with no LLM decomposition — the reproducibility path for curated production runs.
 
 ## Runtime Modes
 
@@ -101,6 +105,8 @@ For the manual production-like setup (separate control-plane, Conductor, and nod
 | `agent compile` | Generate YAML definitions from Markdown descriptions |
 | `node serve` | Run an external node host |
 | `node token create` | Create a node enrollment token |
+| `control-plane serve` | Run the control-plane service as a standalone process |
+| `bench` | Run benchmark scenarios and produce comparison reports |
 | `status` | Show agent status and token usage |
 | `metrics` | Cost and usage report from debug logs |
 | `verify` | Check bundle integrity and sign bundle metadata |
@@ -138,7 +144,6 @@ Go 1.24+.
 - [Storage Architecture](docs/storage-architecture.md)
 - [Identity Architecture](docs/identity-architecture.md)
 - [Production Identity Deployment](docs/production-identity-deployment.md)
-- [Roadmap](docs/roadmap.md)
 - [Glossary](docs/glossary.md)
 
 ## License

@@ -100,6 +100,10 @@
 
 **Disambiguation**: The Conductor's request-clarity step before decomposition. If the request is ambiguous, the user is asked to clarify before work starts.
 
-**Decomposition Template**: A template used to guide task-graph generation for common request shapes.
+**Decomposition Template**: A template used to guide task-graph generation for common request shapes. Loaded from the embedded defaults plus any project-level `templates/` directory.
+
+**Strict Template**: A decomposition template with `strict: true`. When enough of its `match_keywords` hit the user request, the Conductor skips the LLM decompose pass and dispatches the template's literal task list, eliminating conductor reinterpretation for production runs.
+
+**Sync Barrier**: The pair of storage operations that give cross-task consistency on the shared tier: an agent syncs its workspace back to storage before emitting `task_result`, and every task refreshes its shared-tier snapshot before its first LLM call. See Storage Architecture.
 
 **Eino**: The Go library agentfab uses for LLM provider integrations.

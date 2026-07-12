@@ -116,6 +116,8 @@ When the user submits a request:
 6. Request and task state are persisted through the control plane.
 7. Results, artifacts, and knowledge updates are written to storage.
 
+Decomposition can be guided by task-graph templates. Ordinary templates are starting points the LLM decompose pass may adapt; a template marked `strict: true` bypasses the LLM entirely when its keywords strongly match the request, so the template's literal task list is dispatched with no reinterpretation. This is the reproducibility path for curated production runs.
+
 Implementation details live in [Orchestration Internals](orchestration-internals.md).
 
 ## Task Graphs
@@ -307,5 +309,4 @@ Platform behavior:
 - [Runtime Modes](runtime-modes.md)
 - [Orchestration Internals](orchestration-internals.md)
 - [Identity Architecture](identity-architecture.md)
-- [Roadmap](roadmap.md)
 - [Glossary](glossary.md)

@@ -18,6 +18,7 @@ This document focuses on what the code does today:
 | `internal/conductor/setup.go` | Fabric setup, agent spawn path, external-node readiness checks |
 | `internal/conductor/scheduler.go` | DAG execution, task dispatch, demux, task persistence, loop dispatch |
 | `internal/conductor/decompose.go` | Request decomposition into task graphs |
+| `internal/conductor/templates.go` | Decompose templates, strict-template selection, template-to-graph expansion |
 | `internal/conductor/disambiguate.go` | Request clarity evaluation |
 | `internal/conductor/chat.go` | Direct agent chat and amendment routing |
 | `internal/taskgraph/types.go` | TaskNode schema, profile and instance metadata |
@@ -111,6 +112,14 @@ At a high level:
 Important property:
 
 - cancellation is wired before the scheduler exists, so the Conductor can abort during screening or decomposition as well as during execution
+
+### Decomposition Templates and Strict Mode
+
+Decomposition is guided by templates loaded from the embedded `defaults/templates/*.yaml` plus any `templates/` directory in the active project (project templates override embedded ones by name).
+
+By default templates are advisory: the LLM decompose pass sees them as starting points it may adapt to the request. A template with `strict: true` is authoritative instead. `selectStrictTemplate` (`internal/conductor/templates.go`) scores each strict template by counting case-insensitive `match_keywords` hits against the user request; if the best score reaches `strictMatchThreshold`, the LLM decompose pass is skipped entirely and the template's literal task list and loops are expanded directly into the task graph.
+
+This exists because the LLM decompose pass occasionally re-introduced tasks that the operator's prompt explicitly forbade. Strict templates trade adaptability for exact reproducibility, which is the right default for production runs driven by a curated template.
 
 ## 5. Task Graph Execution
 
@@ -207,6 +216,10 @@ The agent runtime is responsible for:
 - updating knowledge and logs
 
 In external-node mode, node hosts create these same native agent runtimes and expose them over gRPC.
+
+LLM calls run through the metering layer in `internal/llm/meter.go`. Each call gets a 35-minute streaming window (`defaultCallTimeout`), and transient provider failures (rate limits, 5xx, connection resets, stalled or empty streams) are retried up to 6 times with 12-minute windows and jittered exponential backoff before the failure escalates to the task level.
+
+At task boundaries the agent runtime enforces the cross-task storage barriers described in [Storage Architecture](storage-architecture.md): the shared tier is refreshed at the start of `executeTask`, and the workspace is synced back to storage in `sendResult` before the `task_result` message is emitted.
 
 ## 10. External Node Runtime
 
